@@ -50,6 +50,11 @@ pub const Theme = struct {
     // Icon Colors
     icon: Color,
     icon_muted: Color,
+
+    // File Attachment Chip
+    file_chip_bg: Color,
+    file_chip_text: Color,
+    file_chip_icon: Color,
 };
 
 // =============================================================================
@@ -97,6 +102,11 @@ pub const light = Theme{
     // Icon Colors
     .icon = Color.rgb(0.40, 0.40, 0.50),
     .icon_muted = Color.rgb(0.55, 0.55, 0.62),
+
+    // File Attachment Chip
+    .file_chip_bg = Color.rgba(0.545, 0.361, 0.965, 0.12),
+    .file_chip_text = Color.rgb(0.45, 0.28, 0.82),
+    .file_chip_icon = Color.rgb(0.545, 0.361, 0.965),
 };
 
 // =============================================================================
@@ -144,6 +154,11 @@ pub const dark = Theme{
     // Icon Colors
     .icon = Color.rgb(0.62, 0.62, 0.68),
     .icon_muted = Color.rgb(0.48, 0.48, 0.54),
+
+    // File Attachment Chip
+    .file_chip_bg = Color.rgba(0.545, 0.361, 0.965, 0.2),
+    .file_chip_text = Color.rgb(0.72, 0.58, 0.98),
+    .file_chip_icon = Color.rgb(0.65, 0.50, 0.95),
 };
 
 // =============================================================================

@@ -18,6 +18,21 @@ pub const AppState = state_mod.AppState;
 
 var state = AppState{};
 
+/// Handle global keyboard shortcuts
+fn onEvent(cx: *gooey.Cx, event: gooey.InputEvent) bool {
+    switch (event) {
+        .key_down => |k| {
+            // Cmd+Q to quit
+            if (k.key == .q and k.modifiers.cmd) {
+                cx.quit();
+                return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
 const App = gooey.App(AppState, &state, layout.render, .{
     .title = "ChatAI",
     .width = 500,
@@ -32,6 +47,8 @@ const App = gooey.App(AppState, &state, layout.render, .{
     // Transparent titlebar for seamless look
     .titlebar_transparent = true,
     .full_size_content = true,
+    // Handle global keyboard shortcuts
+    .on_event = onEvent,
 });
 
 pub fn main() !void {

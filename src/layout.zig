@@ -13,6 +13,7 @@ const VirtualListState = gooey.VirtualListState;
 const Svg = gooey.Svg;
 const Lucide = gooey.Lucide;
 const Select = gooey.Select;
+const Easing = gooey.Easing;
 
 const state_mod = @import("state.zig");
 const theme_mod = @import("theme.zig");
@@ -27,10 +28,13 @@ const Theme = theme_mod.Theme;
 // Layout Constants
 // =============================================================================
 
-const INPUT_CARD_CORNER_RADIUS: f32 = 16;
-const BUBBLE_CORNER_RADIUS: f32 = 12;
-const BUTTON_CORNER_RADIUS: f32 = 6;
-const CONTENT_PADDING: f32 = 24;
+const INPUT_CARD_CORNER_RADIUS = 16;
+const BUBBLE_CORNER_RADIUS = 12;
+const BUTTON_CORNER_RADIUS = 6;
+const CONTENT_PADDING = 24;
+
+var last_dark_mode: ?bool = null;
+var last_window_width: ?f32 = null;
 
 // =============================================================================
 // Root Layout
@@ -45,6 +49,20 @@ pub fn render(cx: *Cx) void {
     if (s.gooey_ptr == null) {
         s.init(cx.gooey());
     }
+
+    if (last_dark_mode) |prev_mode| {
+        if (prev_mode != s.dark_mode) {
+            s.invalidateCachedHeights();
+        }
+    }
+    last_dark_mode = s.dark_mode;
+
+    if (last_window_width) |prev_width| {
+        if (prev_width != size.width) {
+            s.invalidateCachedHeights();
+        }
+    }
+    last_window_width = size.width;
 
     // Main container - full window, no nested card
     cx.render(ui.box(.{
@@ -65,8 +83,8 @@ pub fn render(cx: *Cx) void {
                 .attach_to_parent = false,
                 .element_anchor = .right_top,
                 .parent_anchor = .right_top,
-                .offset_x = -12,
-                .offset_y = 8,
+                .offset_x = -4,
+                .offset_y = 0,
                 .z_index = 200,
             },
         }, .{
@@ -94,7 +112,7 @@ const ThemeToggle = struct {
             .alignment = .{ .main = .center, .cross = .center },
             .on_click_handler = cx.command(AppState, AppState.toggleDarkMode),
         }, .{
-            Svg{ .path = icon_path, .size = 20, .no_fill = true, .stroke_color = t.icon_muted, .stroke_width = 1.5 },
+            Svg{ .path = icon_path, .size = 16, .no_fill = true, .stroke_color = t.icon_muted, .stroke_width = 1.0 },
         }));
     }
 };
@@ -118,9 +136,7 @@ const ContentArea = struct {
                 .gap = 16,
                 .padding = .{ .all = CONTENT_PADDING },
             }, .{
-                ui.text("👋", .{
-                    .size = 48,
-                }),
+                Svg{ .path = Lucide.zap, .size = 48, .no_fill = true, .stroke_color = t.primary, .stroke_width = 1.5 },
                 ui.text("How can I help you today?", .{
                     .color = t.text,
                     .size = 18,
@@ -159,8 +175,9 @@ const ContentArea = struct {
 };
 
 fn renderMessage(index: u32, cx: *Cx) f32 {
-    const s = cx.stateConst(AppState);
-    const msg = s.getMessage(index) orelse return 0;
+    const s = cx.state(AppState);
+    const message_index: usize = @intCast(index);
+    const msg = s.getMessage(message_index) orelse return 0;
     const is_user = msg.role == .user;
 
     // Calculate max bubble width: window width minus all horizontal padding
@@ -168,21 +185,48 @@ fn renderMessage(index: u32, cx: *Cx) f32 {
     // Virtual list: CONTENT_PADDING (24) left + CONTENT_PADDING (24) right = 48
     const max_bubble_width = cx.windowSize().width - 40 - (CONTENT_PADDING * 2);
 
-    if (is_user) {
-        return renderUserMessage(msg, s.dark_mode, max_bubble_width, cx);
-    } else {
-        return renderAssistantMessage(msg, s.dark_mode, max_bubble_width, cx);
+    var height = s.getMessageCachedHeight(message_index);
+    if (height <= 0.0) {
+        height = if (is_user)
+            estimateUserMessageHeight(msg, max_bubble_width)
+        else
+            estimateAssistantMessageHeight(msg, max_bubble_width);
+        s.setMessageCachedHeight(message_index, height);
     }
+
+    if (is_user) {
+        renderUserMessage(msg, s.dark_mode, max_bubble_width, cx);
+    } else {
+        renderAssistantMessage(msg, s.dark_mode, max_bubble_width, cx);
+    }
+
+    return height;
 }
 
-fn renderUserMessage(msg: *const Message, dark_mode: bool, max_width: f32, cx: *Cx) f32 {
-    const t = theme_mod.get(dark_mode);
-    const text_content = msg.getText();
+fn estimateUserMessageHeight(msg: *const Message, max_width: f32) f32 {
+    const has_attachment = msg.hasAttachment();
 
-    // Estimate height based on max width
     const chars_per_line: usize = @max(1, @as(usize, @intFromFloat(max_width / 8.0)));
     const lines: usize = @max(1, (msg.content_len + chars_per_line - 1) / chars_per_line);
-    const height: f32 = @as(f32, @floatFromInt(lines)) * 24.0 + 32.0;
+    var height: f32 = @as(f32, @floatFromInt(lines)) * 24.0 + 32.0;
+
+    if (has_attachment) {
+        height += 32.0; // chip height + spacing
+    }
+
+    return height;
+}
+
+fn estimateAssistantMessageHeight(msg: *const Message, max_width: f32) f32 {
+    const chars_per_line: usize = @max(1, @as(usize, @intFromFloat(max_width / 8.0)));
+    const lines: usize = @max(1, (msg.content_len + chars_per_line - 1) / chars_per_line);
+    return @as(f32, @floatFromInt(lines)) * 24.0 + 16.0;
+}
+
+fn renderUserMessage(msg: *const Message, dark_mode: bool, max_width: f32, cx: *Cx) void {
+    const t = theme_mod.get(dark_mode);
+    const text_content = msg.getText();
+    const has_attachment = msg.hasAttachment();
 
     // User message in a rounded box with subtle border
     cx.render(ui.box(.{
@@ -193,24 +237,44 @@ fn renderUserMessage(msg: *const Message, dark_mode: bool, max_width: f32, cx: *
         .border_width = 1,
         .corner_radius = BUBBLE_CORNER_RADIUS,
     }, .{
-        ui.text(text_content, .{
-            .color = t.text,
-            .size = 15,
-            .wrap = .words,
+        ui.box(.{ .direction = .column, .gap = 10 }, .{
+            // File attachment chip (if present)
+            ui.when(has_attachment, .{
+                ui.box(.{
+                    .padding = .{ .symmetric = .{ .x = 10, .y = 6 } },
+                    .background = t.file_chip_bg,
+                    .corner_radius = 8,
+                }, .{
+                    ui.box(.{ .direction = .row, .gap = 6, .alignment = .{ .main = .start, .cross = .center } }, .{
+                        // File icon
+                        Svg{
+                            .path = Lucide.file,
+                            .size = 14,
+                            .no_fill = true,
+                            .stroke_color = t.file_chip_icon,
+                            .stroke_width = 1.5,
+                        },
+                        ui.text(msg.getAttachedFileName(), .{
+                            .color = t.file_chip_text,
+                            .size = 13,
+                            .weight = .medium,
+                        }),
+                    }),
+                }),
+            }),
+            // Message text
+            ui.text(text_content, .{
+                .color = t.text,
+                .size = 15,
+                .wrap = .words,
+            }),
         }),
     }));
-
-    return height;
 }
 
-fn renderAssistantMessage(msg: *const Message, dark_mode: bool, max_width: f32, cx: *Cx) f32 {
+fn renderAssistantMessage(msg: *const Message, dark_mode: bool, max_width: f32, cx: *Cx) void {
     const t = theme_mod.get(dark_mode);
     const text_content = msg.getText();
-
-    // Estimate height based on max width
-    const chars_per_line: usize = @max(1, @as(usize, @intFromFloat(max_width / 8.0)));
-    const lines: usize = @max(1, (msg.content_len + chars_per_line - 1) / chars_per_line);
-    const height: f32 = @as(f32, @floatFromInt(lines)) * 24.0 + 16.0;
 
     // Assistant response - plain text, no bubble
     cx.render(ui.box(.{
@@ -223,8 +287,6 @@ fn renderAssistantMessage(msg: *const Message, dark_mode: bool, max_width: f32, 
             .wrap = .words,
         }),
     }));
-
-    return height;
 }
 
 // =============================================================================
@@ -264,29 +326,58 @@ const InputArea = struct {
                 .corner_radius = INPUT_CARD_CORNER_RADIUS,
                 .direction = .column,
             }, .{
-                // Attach file row
+                // Attach file row (clickable)
                 ui.box(.{
                     .fill_width = true,
                     .padding = .{ .symmetric = .{ .x = 16, .y = 12 } },
                     .direction = .row,
                     .gap = 12,
                     .alignment = .{ .main = .start, .cross = .center },
+                    .on_click_handler = cx.command(AppState, AppState.openFileDialog),
                 }, .{
                     // Attachment icon
-                    ui.text("📎", .{
-                        .color = t.icon,
-                        .size = 16,
-                    }),
+                    Svg{ .path = Lucide.paperclip, .size = 16, .no_fill = true, .stroke_color = t.icon, .stroke_width = 1.5 },
                     // Divider
                     ui.box(.{
                         .width = 1,
                         .height = 18,
                         .background = t.border,
                     }, .{}),
-                    // Attach file text
-                    ui.text("Attach file", .{
-                        .color = t.text_secondary,
-                        .size = 14,
+                    // Attach file text or selected file name
+                    ui.when(!s.has_attached_file, .{
+                        ui.text("Attach file", .{
+                            .color = t.text_secondary,
+                            .size = 14,
+                        }),
+                    }),
+                    ui.when(s.has_attached_file, .{
+                        ui.box(.{
+                            .direction = .row,
+                            .gap = 8,
+                            .alignment = .{ .main = .start, .cross = .center },
+                        }, .{
+                            ui.text(s.getAttachedFileName(), .{
+                                .color = t.primary,
+                                .size = 14,
+                            }),
+                            // Clear button
+                            ui.box(.{
+                                .width = 18,
+                                .height = 18,
+                                .corner_radius = 9,
+                                .background = t.border,
+                                .alignment = .{ .main = .center, .cross = .center },
+                                .on_click_handler = cx.command(AppState, AppState.clearAttachedFile),
+                            }, .{
+                                Svg{
+                                    .path = Lucide.x,
+                                    .size = 12,
+                                    .no_fill = true,
+                                    .stroke_color = t.text_secondary,
+                                    .stroke_width = 1.5,
+                                },
+                            }),
+                        }),
                     }),
                 }),
                 // Text input area - full width
@@ -329,17 +420,24 @@ const InputArea = struct {
                         else
                             null,
                     }, .{
-                        Svg{
-                            .path = if (s.is_loading) Lucide.loader else Lucide.send,
-                            .size = 18,
-                            .no_fill = true,
-                            // .stroke_color = ui.Color.hex(0xe2e8f0),
-                            .stroke_width = 1,
-                            .stroke_color = if (s.input_slice.len > 0 and s.has_api_key)
-                                (if (s.dark_mode) t.card else Color.white)
-                            else
-                                t.icon_muted,
-                        },
+                        ui.when(s.is_loading, .{
+                            LoadingSpinner{
+                                .size = 18,
+                                .color = if (s.dark_mode) t.card else Color.white,
+                            },
+                        }),
+                        ui.when(!s.is_loading, .{
+                            Svg{
+                                .path = Lucide.send,
+                                .size = 18,
+                                .no_fill = true,
+                                .stroke_width = 1,
+                                .stroke_color = if (s.input_slice.len > 0 and s.has_api_key)
+                                    (if (s.dark_mode) t.card else Color.white)
+                                else
+                                    t.icon_muted,
+                            },
+                        }),
                     }),
                 }),
             }),
@@ -350,6 +448,78 @@ const InputArea = struct {
 // =============================================================================
 // Model Selector Component
 // =============================================================================
+
+// =============================================================================
+// Loading Spinner (Animated 3-Dot Pulse)
+// =============================================================================
+
+const LoadingSpinner = struct {
+    size: f32 = 18,
+    color: Color = Color.white,
+
+    pub fn render(self: @This(), cx: *Cx) void {
+        // Continuous animation for the spinner
+        const pulse = cx.animate("loading-spinner", .{
+            .duration_ms = 1200,
+            .easing = Easing.linear,
+            .mode = .loop,
+        });
+
+        const progress = pulse.progress;
+        const dot_size = self.size * 0.3;
+        const gap = (self.size - dot_size * 3) / 2.0;
+
+        cx.render(ui.box(.{
+            .width = self.size,
+            .height = self.size,
+            .direction = .row,
+            .gap = gap,
+            .alignment = .{ .main = .center, .cross = .center },
+        }, .{
+            PulseDot{ .index = 0, .progress = progress, .dot_size = dot_size, .color = self.color },
+            PulseDot{ .index = 1, .progress = progress, .dot_size = dot_size, .color = self.color },
+            PulseDot{ .index = 2, .progress = progress, .dot_size = dot_size, .color = self.color },
+        }));
+    }
+};
+
+const PulseDot = struct {
+    index: u8,
+    progress: f32,
+    dot_size: f32,
+    color: Color,
+
+    pub fn render(self: @This(), cx: *Cx) void {
+        // Each dot pulses with a phase offset (0, 0.33, 0.66)
+        const phase_offset = @as(f32, @floatFromInt(self.index)) * 0.33;
+        var phase = self.progress + phase_offset;
+        if (phase >= 1.0) phase -= 1.0;
+
+        // Create a smooth pulse: fade in, then fade out
+        // Use a sine-like curve for smoother animation
+        const pulse_progress = if (phase < 0.5)
+            phase * 2.0 // 0 to 1 during first half
+        else
+            (1.0 - phase) * 2.0; // 1 to 0 during second half
+
+        const scale = 0.6 + 0.4 * pulse_progress;
+        const opacity = 0.3 + 0.7 * pulse_progress;
+        const size = self.dot_size * scale;
+
+        cx.render(ui.box(.{
+            .width = self.dot_size,
+            .height = self.dot_size,
+            .alignment = .{ .main = .center, .cross = .center },
+        }, .{
+            ui.box(.{
+                .width = size,
+                .height = size,
+                .corner_radius = size / 2.0,
+                .background = self.color.withAlpha(opacity),
+            }, .{}),
+        }));
+    }
+};
 
 const ModelSelector = struct {
     // Anthropic logo SVG path (viewBox: 0 0 92.2 65)
