@@ -1,0 +1,17 @@
+.{
+    .name = .chat_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xe10436242903a945,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .gooey = .{
+            .url = "git+https://github.com/duanebester/gooey.git#v0.0.9",
+            .hash = "gooey-0.0.9-uPBZ7vWvRACq2fXN11xcplkOzBKDRgw1Nx6KtgLH2vRi",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
