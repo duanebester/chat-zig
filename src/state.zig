@@ -10,7 +10,11 @@
 const std = @import("std");
 const log = std.log.scoped(.chatzig);
 const gooey = @import("gooey");
-const file_dialog = gooey.platform.mac.file_dialog;
+const builtin = @import("builtin");
+const file_dialog = if (builtin.os.tag == .linux)
+    gooey.platform.linux.file_dialog
+else
+    gooey.platform.mac.file_dialog;
 
 const http = @import("http.zig");
 const VirtualListState = gooey.VirtualListState;
