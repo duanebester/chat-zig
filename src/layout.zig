@@ -17,6 +17,7 @@ const Easing = gooey.Easing;
 
 const state_mod = @import("state.zig");
 const theme_mod = @import("theme.zig");
+const canvas_state = @import("canvas_state.zig");
 
 const AppState = state_mod.AppState;
 const Message = state_mod.Message;
@@ -32,9 +33,9 @@ const INPUT_CARD_CORNER_RADIUS = 16;
 const BUBBLE_CORNER_RADIUS = 12;
 const BUTTON_CORNER_RADIUS = 6;
 const CONTENT_PADDING = 24;
-
-var last_dark_mode: ?bool = null;
-var last_window_width: ?f32 = null;
+const CHAT_MIN_WIDTH: f32 = 400;
+const CANVAS_MIN_WIDTH: f32 = 360;
+const CANVAS_PADDING: f32 = 40;
 
 // =============================================================================
 // Root Layout
@@ -45,39 +46,38 @@ pub fn render(cx: *Cx) void {
     const size = cx.windowSize();
     const t = theme_mod.get(s.dark_mode);
 
-    // Initialize state on first render
-    if (s.gooey_ptr == null) {
-        s.init(cx.gooey());
+    // Keep canvas theme in sync with app theme.
+    canvas_state.setTheme(s.dark_mode);
+
+    if (cx.changed("dark_mode", s.dark_mode) or cx.changed("window_width", size.width)) {
+        s.invalidateCachedHeights();
     }
 
-    if (last_dark_mode) |prev_mode| {
-        if (prev_mode != s.dark_mode) {
-            s.invalidateCachedHeights();
-        }
-    }
-    last_dark_mode = s.dark_mode;
-
-    if (last_window_width) |prev_width| {
-        if (prev_width != size.width) {
-            s.invalidateCachedHeights();
-        }
-    }
-    last_window_width = size.width;
-
-    // Main container - full window, no nested card
+    // Main container - full window
     cx.render(ui.box(.{
         .width = size.width,
         .height = size.height,
         .background = t.bg,
-        .direction = .column,
-        // Account for titlebar area
-        .padding = .{ .each = .{ .top = 52, .bottom = 20, .left = 20, .right = 20 } },
+        .direction = .row,
     }, .{
-        // Content area (messages or empty state)
-        ContentArea{},
-        // Input area card at bottom
-        InputArea{},
-        // Theme toggle - floating in titlebar area (top-right of viewport)
+        // Chat column (grows to fill, with a minimum width so it doesn't collapse)
+        ui.box(.{
+            .grow = true,
+            .min_width = CHAT_MIN_WIDTH,
+            .height = size.height,
+            .direction = .column,
+            .padding = .{ .each = .{ .top = 52, .bottom = 20, .left = 20, .right = 20 } },
+        }, .{
+            // Content area (messages or empty state)
+            ContentArea{},
+            // Input area card at bottom
+            InputArea{},
+        }),
+        // Canvas panel (shown when enabled and has content or is loading)
+        ui.when(s.canvas_enabled, .{
+            CanvasPanel{},
+        }),
+        // Toolbar — floating in titlebar area (top-right of viewport)
         ui.box(.{
             .floating = .{
                 .attach_to_parent = false,
@@ -87,11 +87,119 @@ pub fn render(cx: *Cx) void {
                 .offset_y = 0,
                 .z_index = 200,
             },
+            .direction = .row,
+            .gap = 4,
         }, .{
+            CanvasToggle{},
             ThemeToggle{},
         }),
     }));
 }
+
+// =============================================================================
+// Canvas Panel (right side panel showing the AI canvas)
+// =============================================================================
+
+const CanvasPanel = struct {
+    pub fn render(_: @This(), cx: *Cx) void {
+        const s = cx.state(AppState);
+        const t = theme_mod.get(s.dark_mode);
+        const size = cx.windowSize();
+
+        // Canvas panel takes ~45% of window width, clamped to reasonable bounds.
+        const raw_panel_w = size.width * 0.45;
+        const panel_w = @max(CANVAS_MIN_WIDTH, @min(raw_panel_w, canvas_state.CANVAS_WIDTH + CANVAS_PADDING));
+
+        cx.render(ui.box(.{
+            .width = panel_w,
+            .min_width = CANVAS_MIN_WIDTH,
+            .height = size.height,
+            .direction = .column,
+            .padding = .{ .each = .{ .top = 52, .bottom = 20, .left = 0, .right = 20 } },
+            .gap = 8,
+        }, .{
+            // Canvas header
+            ui.box(.{
+                .fill_width = true,
+                .padding = .{ .symmetric = .{ .x = 8, .y = 4 } },
+                .direction = .row,
+                .alignment = .{ .main = .start, .cross = .center },
+                .gap = 8,
+            }, .{
+                Svg{ .path = Lucide.pen_tool, .size = 14, .no_fill = true, .stroke_color = t.accent, .stroke_width = 1.5 },
+                ui.text("Canvas", .{
+                    .size = 13,
+                    .color = t.text_secondary,
+                    .weight = .medium,
+                }),
+                ui.spacer(),
+                ui.textFmt("{d} cmds", .{canvas_state.commandCount()}, .{
+                    .size = 11,
+                    .color = t.text_muted,
+                }),
+            }),
+            // Canvas area with border
+            ui.box(.{
+                .fill_width = true,
+                .grow = true,
+                .background = if (s.dark_mode) Color.rgba(0.08, 0.08, 0.10, 1.0) else Color.rgba(0.96, 0.96, 0.97, 1.0),
+                .border_color = t.border,
+                .border_width = .{ .all = 1 },
+                .corner_radius = 8,
+                .alignment = .{ .main = .center, .cross = .center },
+            }, .{
+                ui.when(canvas_state.hasContent(), .{
+                    ui.canvas(panel_w - CANVAS_PADDING, canvas_state.CANVAS_HEIGHT, canvas_state.paintCanvas),
+                }),
+                ui.when(!canvas_state.hasContent(), .{
+                    ui.box(.{
+                        .direction = .column,
+                        .alignment = .{ .main = .center, .cross = .center },
+                        .gap = 12,
+                    }, .{
+                        Svg{ .path = Lucide.image, .size = 32, .no_fill = true, .stroke_color = t.text_muted, .stroke_width = 1.0 },
+                        ui.text("Ask me to draw something", .{
+                            .size = 14,
+                            .color = t.text_muted,
+                        }),
+                    }),
+                }),
+            }),
+        }));
+    }
+};
+
+// =============================================================================
+// Canvas Toggle Button
+// =============================================================================
+
+const CanvasToggle = struct {
+    pub fn render(_: @This(), cx: *Cx) void {
+        const s = cx.state(AppState);
+        const t = theme_mod.get(s.dark_mode);
+
+        cx.render(ui.box(.{
+            .width = 36,
+            .height = 36,
+            .corner_radius = 8,
+            .alignment = .{ .main = .center, .cross = .center },
+            .background = if (s.canvas_enabled) t.accent.withAlpha(0.15) else Color.transparent,
+            .on_click_handler = cx.command(AppState.toggleCanvas),
+        }, .{
+            Svg{
+                .path = Lucide.pen_tool,
+                .size = 16,
+                .no_fill = true,
+                .stroke_color = if (s.canvas_enabled) t.accent else t.icon_muted,
+                .stroke_width = 1.0,
+            },
+        }));
+    }
+};
+
+// =============================================================================
+// Theme Toggle
+// =============================================================================
 
 const ThemeToggle = struct {
     // Sun/Moon SVG paths (Lucide-style XML format)
@@ -110,7 +218,7 @@ const ThemeToggle = struct {
             .height = 36,
             .corner_radius = 8,
             .alignment = .{ .main = .center, .cross = .center },
-            .on_click_handler = cx.command(AppState, AppState.toggleDarkMode),
+            .on_click_handler = cx.command(AppState.toggleDarkMode),
         }, .{
             Svg{ .path = icon_path, .size = 16, .no_fill = true, .stroke_color = t.icon_muted, .stroke_width = 1.0 },
         }));
@@ -188,9 +296,9 @@ fn renderMessage(index: u32, cx: *Cx) f32 {
     var height = s.getMessageCachedHeight(message_index);
     if (height <= 0.0) {
         height = if (is_user)
-            estimateUserMessageHeight(msg, max_bubble_width)
+            measureUserMessageHeight(cx, msg, max_bubble_width)
         else
-            estimateAssistantMessageHeight(msg, max_bubble_width);
+            measureAssistantMessageHeight(cx, msg, max_bubble_width);
         s.setMessageCachedHeight(message_index, height);
     }
 
@@ -203,21 +311,55 @@ fn renderMessage(index: u32, cx: *Cx) f32 {
     return height;
 }
 
-fn estimateUserMessageHeight(msg: *const Message, max_width: f32) f32 {
+/// Measure user message height using the platform text shaper (CoreText/HarfBuzz/browser).
+/// Falls back to character-width heuristic if measureText is unavailable.
+fn measureUserMessageHeight(cx: *Cx, msg: *const Message, max_width: f32) f32 {
     const has_attachment = msg.hasAttachment();
+    const h_padding: f32 = 32.0; // .symmetric = .{ .x = 16, .y = 14 } → 16 * 2
+    const v_padding: f32 = 28.0; // 14 * 2
 
-    const chars_per_line: usize = @max(1, @as(usize, @intFromFloat(max_width / 8.0)));
-    const lines: usize = @max(1, (msg.content_len + chars_per_line - 1) / chars_per_line);
-    var height: f32 = @as(f32, @floatFromInt(lines)) * 24.0 + 32.0;
+    const m = cx.measureText(msg.getText(), .{
+        .max_width = max_width - h_padding,
+        .font_size = 15,
+    }) catch {
+        return fallbackUserHeight(msg, max_width);
+    };
 
+    var height = m.height + v_padding;
     if (has_attachment) {
-        height += 32.0; // chip height + spacing
+        height += 32.0; // chip height + gap
     }
-
     return height;
 }
 
-fn estimateAssistantMessageHeight(msg: *const Message, max_width: f32) f32 {
+/// Measure assistant message height using the platform text shaper.
+/// Falls back to character-width heuristic if measureText is unavailable.
+fn measureAssistantMessageHeight(cx: *Cx, msg: *const Message, max_width: f32) f32 {
+    const h_padding: f32 = 8.0; // .symmetric = .{ .x = 4 } → 4 * 2
+
+    const m = cx.measureText(msg.getText(), .{
+        .max_width = max_width - h_padding,
+        .font_size = 15,
+    }) catch {
+        return fallbackAssistantHeight(msg, max_width);
+    };
+
+    return m.height;
+}
+
+// ── Fallback heuristics (used when measureText is unavailable) ───────────
+
+fn fallbackUserHeight(msg: *const Message, max_width: f32) f32 {
+    const chars_per_line: usize = @max(1, @as(usize, @intFromFloat(max_width / 8.0)));
+    const lines: usize = @max(1, (msg.content_len + chars_per_line - 1) / chars_per_line);
+    var height: f32 = @as(f32, @floatFromInt(lines)) * 24.0 + 32.0;
+    if (msg.hasAttachment()) {
+        height += 32.0;
+    }
+    return height;
+}
+
+fn fallbackAssistantHeight(msg: *const Message, max_width: f32) f32 {
     const chars_per_line: usize = @max(1, @as(usize, @intFromFloat(max_width / 8.0)));
     const lines: usize = @max(1, (msg.content_len + chars_per_line - 1) / chars_per_line);
     return @as(f32, @floatFromInt(lines)) * 24.0 + 16.0;
@@ -234,7 +376,7 @@ fn renderUserMessage(msg: *const Message, dark_mode: bool, max_width: f32, cx: *
         .padding = .{ .symmetric = .{ .x = 16, .y = 14 } },
         .background = t.user_bubble,
         .border_color = t.user_bubble_border,
-        .border_width = 1,
+        .border_width = .{ .all = 1 },
         .corner_radius = BUBBLE_CORNER_RADIUS,
     }, .{
         ui.box(.{ .direction = .column, .gap = 10 }, .{
@@ -322,7 +464,7 @@ const InputArea = struct {
                 .fill_width = true,
                 .background = t.input_area_bg,
                 .border_color = t.border_input,
-                .border_width = 1,
+                .border_width = .{ .all = 1 },
                 .corner_radius = INPUT_CARD_CORNER_RADIUS,
                 .direction = .column,
             }, .{
@@ -333,16 +475,16 @@ const InputArea = struct {
                     .direction = .row,
                     .gap = 12,
                     .alignment = .{ .main = .start, .cross = .center },
-                    .on_click_handler = cx.command(AppState, AppState.openFileDialog),
+                    .on_click_handler = cx.command(AppState.openFileDialog),
                 }, .{
                     // Attachment icon
                     Svg{ .path = Lucide.paperclip, .size = 16, .no_fill = true, .stroke_color = t.icon, .stroke_width = 1.5 },
                     // Divider
-                    ui.box(.{
+                    ui.rect(.{
                         .width = 1,
                         .height = 18,
                         .background = t.border,
-                    }, .{}),
+                    }),
                     // Attach file text or selected file name
                     ui.when(!s.has_attached_file, .{
                         ui.text("Attach file", .{
@@ -367,7 +509,7 @@ const InputArea = struct {
                                 .corner_radius = 9,
                                 .background = t.border,
                                 .alignment = .{ .main = .center, .cross = .center },
-                                .on_click_handler = cx.command(AppState, AppState.clearAttachedFile),
+                                .on_click_handler = cx.command(AppState.clearAttachedFile),
                             }, .{
                                 Svg{
                                     .path = Lucide.x,
@@ -388,7 +530,7 @@ const InputArea = struct {
                     gooey.TextArea{
                         .id = "chat-input",
                         .placeholder = if (s.has_api_key) "Ask me anything" else "API key required",
-                        .bind = @constCast(&s.input_slice),
+                        .bind = &s.input_slice,
                         .rows = 2,
                         .background = Color.transparent,
                         .border_color = Color.transparent,
@@ -416,7 +558,7 @@ const InputArea = struct {
                         .background = if (s.input_slice.len > 0 and s.has_api_key and !s.is_loading) t.primary else t.border,
                         .alignment = .{ .main = .center, .cross = .center },
                         .on_click_handler = if (s.has_api_key and !s.is_loading and s.input_slice.len > 0)
-                            cx.command(AppState, AppState.sendMessage)
+                            cx.command(AppState.sendMessage)
                         else
                             null,
                     }, .{
@@ -511,12 +653,12 @@ const PulseDot = struct {
             .height = self.dot_size,
             .alignment = .{ .main = .center, .cross = .center },
         }, .{
-            ui.box(.{
+            ui.rect(.{
                 .width = size,
                 .height = size,
                 .corner_radius = size / 2.0,
                 .background = self.color.withAlpha(opacity),
-            }, .{}),
+            }),
         }));
     }
 };
@@ -551,7 +693,6 @@ const ModelSelector = struct {
                 .id = "model-select",
                 .options = &Model.display_names,
                 .selected = @intFromEnum(s.selected_model),
-                .is_open = s.model_select_open,
                 .width = 160,
                 .background = t.card,
                 .border_color = t.border,
@@ -559,13 +700,7 @@ const ModelSelector = struct {
                 .text_color = t.text_secondary,
                 .hover_background = t.border,
                 .selected_background = t.primary.withAlpha(0.15),
-                .on_toggle_handler = cx.command(AppState, AppState.toggleModelSelect),
-                .on_close_handler = cx.command(AppState, AppState.closeModelSelect),
-                .handlers = &.{
-                    cx.updateWith(AppState, @as(usize, 0), AppState.selectModel),
-                    cx.updateWith(AppState, @as(usize, 1), AppState.selectModel),
-                    cx.updateWith(AppState, @as(usize, 2), AppState.selectModel),
-                },
+                .on_select = cx.onSelect(AppState.selectModel),
             },
         }));
     }

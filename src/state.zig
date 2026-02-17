@@ -10,9 +10,11 @@
 const std = @import("std");
 const log = std.log.scoped(.chatzig);
 const gooey = @import("gooey");
-const file_dialog = gooey.platform.mac.file_dialog;
+const file_dialog = gooey.file_dialog;
 
 const http = @import("http.zig");
+const canvas_state = @import("canvas_state.zig");
+const canvas_tools = @import("canvas_tools.zig");
 const VirtualListState = gooey.VirtualListState;
 
 // =============================================================================
@@ -168,10 +170,14 @@ pub const AppState = struct {
     dark_mode: bool = true, // Start in dark mode like the reference image
 
     // =========================================================================
+    // Canvas State
+    // =========================================================================
+    canvas_enabled: bool = false,
+
+    // =========================================================================
     // Model Selection State
     // =========================================================================
     selected_model: Model = .haiku,
-    model_select_open: bool = false,
 
     // =========================================================================
     // File Attachment State
@@ -197,6 +203,15 @@ pub const AppState = struct {
     pending_file_path_len: usize = 0,
 
     // =========================================================================
+    // Pending Canvas Result (staging area from IO thread)
+    // =========================================================================
+    pending_canvas_lines: [canvas_state.MAX_CANVAS_BUF]u8 = undefined,
+    pending_canvas_lines_len: usize = 0,
+    pending_canvas_text: [MAX_RESPONSE_LEN]u8 = undefined,
+    pending_canvas_text_len: usize = 0,
+    pending_canvas_result: ?http.CanvasResult = null,
+
+    // =========================================================================
     // Threading
     // =========================================================================
     gooey_ptr: ?*gooey.Gooey = null,
@@ -205,7 +220,9 @@ pub const AppState = struct {
     // Initialization
     // =========================================================================
 
-    pub fn init(self: *Self, g: *gooey.Gooey) void {
+    pub fn init(cx: *gooey.Cx) void {
+        const self = cx.state(Self);
+        const g = cx.gooey();
         self.gooey_ptr = g;
 
         // Set initial window appearance based on dark_mode state
@@ -368,18 +385,32 @@ pub const AppState = struct {
             return;
         }
 
-        // Spawn worker thread
-        const thread = std.Thread.spawn(.{}, httpWorker, .{
-            &self.http_client.?,
-            self,
-        }) catch |err| {
-            log.err("Failed to spawn HTTP thread: {}", .{err});
-            self.error_message = "Failed to send message";
-            self.is_loading = false;
-            g.requestRender();
-            return;
-        };
-        thread.detach();
+        // Spawn worker thread — canvas or normal path
+        if (self.canvas_enabled) {
+            const thread = std.Thread.spawn(.{}, canvasWorker, .{
+                &self.http_client.?,
+                self,
+            }) catch |err| {
+                log.err("Failed to spawn canvas thread: {}", .{err});
+                self.error_message = "Failed to send message";
+                self.is_loading = false;
+                g.requestRender();
+                return;
+            };
+            thread.detach();
+        } else {
+            const thread = std.Thread.spawn(.{}, httpWorker, .{
+                &self.http_client.?,
+                self,
+            }) catch |err| {
+                log.err("Failed to spawn HTTP thread: {}", .{err});
+                self.error_message = "Failed to send message";
+                self.is_loading = false;
+                g.requestRender();
+                return;
+            };
+            thread.detach();
+        }
 
         g.requestRender();
     }
@@ -424,6 +455,39 @@ pub const AppState = struct {
     }
 
     // =========================================================================
+    // Canvas Worker Thread (tool-use path)
+    // =========================================================================
+
+    fn canvasWorker(client: *http.AnthropicClient, app: *Self) void {
+        var buf: ChatMessagesBuffer = .{};
+        var request = app.buildChatRequest(&buf);
+
+        // Attach canvas system prompt and tools to the request.
+        request.system = canvas_tools.canvas_system_prompt;
+        request.tools_json = canvas_tools.anthropic_tools_json;
+
+        log.info("Sending canvas request with {d} tools", .{canvas_tools.TOOL_COUNT});
+
+        const result = client.sendForCanvas(
+            request,
+            &app.pending_canvas_lines,
+            &app.pending_canvas_text,
+        );
+
+        if (result.has_error) {
+            app.pending_result = .{ .err = .{ .message = result.error_message } };
+            app.pending_canvas_result = null;
+        } else {
+            app.pending_canvas_lines_len = result.canvas_lines_len;
+            app.pending_canvas_text_len = result.text_len;
+            app.pending_canvas_result = result;
+            app.pending_result = null; // Canvas path uses its own result
+        }
+
+        app.dispatchToMain();
+    }
+
+    // =========================================================================
     // Thread Dispatch (TigersEye pattern)
     // =========================================================================
 
@@ -448,7 +512,13 @@ pub const AppState = struct {
         const s = ctx.app;
         const g = s.gooey_ptr orelse return;
 
-        // Apply pending result if present
+        // Apply pending canvas result if present (canvas path)
+        if (s.pending_canvas_result) |cr| {
+            s.applyCanvasResult(cr);
+            s.pending_canvas_result = null;
+        }
+
+        // Apply pending result if present (normal path)
         if (s.pending_result) |result| {
             s.applyResult(result);
             s.pending_result = null;
@@ -478,6 +548,38 @@ pub const AppState = struct {
     }
 
     // =========================================================================
+    // Apply Canvas Result (main thread only)
+    // =========================================================================
+
+    fn applyCanvasResult(self: *Self, result: http.CanvasResult) void {
+        if (result.has_error) {
+            self.error_message = result.error_message;
+            self.is_loading = false;
+            return;
+        }
+
+        // Clear canvas for fresh batch, then process command lines.
+        canvas_state.clearCanvas();
+        if (result.canvas_lines_len > 0) {
+            const lines = self.pending_canvas_lines[0..result.canvas_lines_len];
+            const count = canvas_state.processBatch(lines);
+            log.info("Canvas: applied {d} draw commands", .{count});
+        }
+
+        // Show any text response from the LLM in the chat.
+        if (result.text_len > 0) {
+            const text = self.pending_canvas_text[0..result.text_len];
+            self.addMessage(Message.assistant(text));
+        } else if (result.canvas_lines_len > 0) {
+            // If only tool calls, add a minimal confirmation message.
+            self.addMessage(Message.assistant("(drew on canvas)"));
+        }
+
+        self.error_message = null;
+        self.is_loading = false;
+    }
+
+    // =========================================================================
     // Theme Toggle
     // =========================================================================
 
@@ -488,20 +590,19 @@ pub const AppState = struct {
     }
 
     // =========================================================================
+    // Canvas Toggle
+    // =========================================================================
+
+    pub fn toggleCanvas(self: *Self, _: *gooey.Gooey) void {
+        self.canvas_enabled = !self.canvas_enabled;
+    }
+
+    // =========================================================================
     // Model Selection Handlers
     // =========================================================================
 
-    pub fn toggleModelSelect(self: *Self, _: *gooey.Gooey) void {
-        self.model_select_open = !self.model_select_open;
-    }
-
-    pub fn closeModelSelect(self: *Self, _: *gooey.Gooey) void {
-        self.model_select_open = false;
-    }
-
     pub fn selectModel(self: *Self, index: usize) void {
         self.selected_model = @enumFromInt(index);
-        self.model_select_open = false;
     }
 
     // =========================================================================
@@ -512,7 +613,7 @@ pub const AppState = struct {
         _ = self;
         // Defer to avoid deadlock - file dialog blocks and processes events
         // which can trigger input handlers while render mutex is held
-        g.deferCommand(Self, Self.openFileDialogDeferred);
+        g.deferCommand(Self.openFileDialogDeferred);
     }
 
     fn openFileDialogDeferred(self: *Self, g: *gooey.Gooey) void {

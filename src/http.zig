@@ -98,6 +98,11 @@ pub const ChatRequest = struct {
     messages: []const ChatMessage,
     /// Optional file attachment (will be added to the last user message)
     attachment: ?FileAttachment = null,
+    /// Optional system prompt (e.g. canvas instructions)
+    system: ?[]const u8 = null,
+    /// Optional Anthropic-format tools JSON array string (comptime-generated).
+    /// When non-null, included verbatim in the request body as `"tools":<json>`.
+    tools_json: ?[]const u8 = null,
 };
 
 // =============================================================================
@@ -507,6 +512,31 @@ pub const ChatResult = struct {
 };
 
 // =============================================================================
+// Canvas Result (for tool-use based drawing)
+// =============================================================================
+
+pub const MAX_CANVAS_LINES_BUF: usize = 32 * 1024;
+pub const MAX_CANVAS_TEXT_BUF: usize = 32 * 1024;
+
+/// Result from a canvas-enabled API call. Contains byte counts for data
+/// written to caller-provided buffers (canvas command lines + text content).
+/// Small struct — actual data lives in the caller's staging buffers.
+pub const CanvasResult = struct {
+    /// Bytes written to the canvas_lines output buffer.
+    canvas_lines_len: usize = 0,
+    /// Bytes written to the text output buffer.
+    text_len: usize = 0,
+    /// Whether an error occurred during the request.
+    has_error: bool = false,
+    /// Static error message (not allocated, no cleanup needed).
+    error_message: []const u8 = "",
+
+    pub fn err(msg: []const u8) CanvasResult {
+        return .{ .has_error = true, .error_message = msg };
+    }
+};
+
+// =============================================================================
 // API Response Types (for std.json parsing)
 // =============================================================================
 
@@ -598,6 +628,220 @@ pub const AnthropicClient = struct {
         };
     }
 
+    // =========================================================================
+    // Canvas (Tool-Use) API
+    // =========================================================================
+
+    /// Send a canvas-enabled request with drawing tools. Extracts tool_use
+    /// blocks as parseCommand-format JSON lines and text content into the
+    /// caller-provided output buffers.
+    pub fn sendForCanvas(
+        self: *Self,
+        request: ChatRequest,
+        canvas_lines_out: []u8,
+        text_out: []u8,
+    ) CanvasResult {
+        std.debug.assert(request.messages.len > 0);
+        std.debug.assert(canvas_lines_out.len > 0);
+        std.debug.assert(text_out.len > 0);
+
+        return self.doCanvasRequest(request, canvas_lines_out, text_out) catch |e| {
+            log.err("Canvas request failed: {}", .{e});
+            return CanvasResult.err("Canvas request failed");
+        };
+    }
+
+    /// Build and send the HTTP request for canvas, parse the response.
+    fn doCanvasRequest(
+        self: *Self,
+        request: ChatRequest,
+        canvas_out: []u8,
+        text_out: []u8,
+    ) !CanvasResult {
+        var client = http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var body_buf: [64 * 1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&body_buf);
+        const w = fbs.writer();
+
+        try w.print("{{\"model\":\"{s}\",\"max_tokens\":{d}", .{ request.model, MAX_TOKENS });
+        if (request.system) |sys| {
+            try w.writeAll(",\"system\":\"");
+            try writeJsonEscapedString(w, sys);
+            try w.writeByte('"');
+        }
+        if (request.tools_json) |tools| {
+            try w.writeAll(",\"tools\":");
+            try w.writeAll(tools);
+        }
+        try w.writeAll(",\"messages\":[");
+
+        var first = true;
+        for (request.messages) |msg| {
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.print("{{\"role\":\"{s}\",\"content\":\"", .{msg.role.apiName()});
+            if (msg.content) |content| try writeJsonEscapedString(w, content);
+            try w.writeAll("\"}");
+        }
+        try w.writeAll("]}");
+
+        const body = fbs.getWritten();
+        std.debug.assert(body.len < body_buf.len);
+        if (LOG_PAYLOADS) log.debug("Canvas request: {s}", .{body});
+
+        const uri = try Uri.parse(API_URL);
+        var req = try client.request(.POST, uri, .{
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "x-api-key", .value = self.api_key },
+                .{ .name = "anthropic-version", .value = "2023-06-01" },
+            },
+        });
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = body.len };
+        try req.sendBodyComplete(body);
+
+        var redir_buf: [8 * 1024]u8 = undefined;
+        var resp = try req.receiveHead(&redir_buf);
+        if (resp.head.status != .ok) {
+            log.err("Canvas API status: {}", .{resp.head.status});
+            return CanvasResult.err("API returned error");
+        }
+
+        var xfer_buf: [64]u8 = undefined;
+        var reader = resp.reader(&xfer_buf);
+        const data = reader.allocRemaining(
+            self.allocator,
+            std.Io.Limit.limited(MAX_RESPONSE_SIZE),
+        ) catch return CanvasResult.err("Failed to read response");
+        defer self.allocator.free(data);
+
+        if (LOG_PAYLOADS) log.debug("Canvas resp: {s}", .{data});
+        return parseCanvasResponse(self.allocator, data, canvas_out, text_out);
+    }
+
+    /// Parse raw API JSON, extracting tool_use blocks as JSON command lines
+    /// and text blocks into separate output buffers.
+    fn parseCanvasResponse(
+        allocator: Allocator,
+        data: []const u8,
+        canvas_out: []u8,
+        text_out: []u8,
+    ) CanvasResult {
+        std.debug.assert(data.len > 0);
+
+        const parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            data,
+            .{},
+        ) catch return CanvasResult.err("JSON parse failed");
+        defer parsed.deinit();
+
+        const root = switch (parsed.value) {
+            .object => |o| o,
+            else => return CanvasResult.err("Not a JSON object"),
+        };
+        const content_items = switch (root.get("content") orelse
+            return CanvasResult.err("No content")) {
+            .array => |a| a.items,
+            else => return CanvasResult.err("Content not array"),
+        };
+
+        var result = CanvasResult{};
+        var line_buf: [4096]u8 = undefined;
+        var lines_off: usize = 0;
+
+        for (content_items) |block| {
+            const obj = switch (block) {
+                .object => |o| o,
+                else => continue,
+            };
+            const tstr = switch (obj.get("type") orelse continue) {
+                .string => |s| s,
+                else => continue,
+            };
+
+            if (std.mem.eql(u8, tstr, "tool_use")) {
+                const name = switch (obj.get("name") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const input = switch (obj.get("input") orelse continue) {
+                    .object => |o| o,
+                    else => continue,
+                };
+                const n = writeToolUseLine(&line_buf, name, input);
+                if (n > 0 and lines_off + n + 1 <= canvas_out.len) {
+                    @memcpy(canvas_out[lines_off..][0..n], line_buf[0..n]);
+                    lines_off += n;
+                    canvas_out[lines_off] = '\n';
+                    lines_off += 1;
+                }
+            } else if (std.mem.eql(u8, tstr, "text")) {
+                const txt = switch (obj.get("text") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                if (result.text_len > 0 and result.text_len < text_out.len) {
+                    text_out[result.text_len] = '\n';
+                    result.text_len += 1;
+                }
+                const clen = @min(txt.len, text_out.len - result.text_len);
+                if (clen > 0) {
+                    @memcpy(text_out[result.text_len..][0..clen], txt[0..clen]);
+                    result.text_len += clen;
+                }
+            }
+        }
+
+        result.canvas_lines_len = lines_off;
+        return result;
+    }
+
+    /// Reconstruct a parseCommand-format JSON line from tool name + input.
+    /// Returns bytes written, or 0 on buffer overflow.
+    fn writeToolUseLine(buf: []u8, name: []const u8, input: std.json.ObjectMap) usize {
+        var fbs = std.io.fixedBufferStream(buf);
+        const tw = fbs.writer();
+
+        tw.writeAll("{\"tool\":\"") catch return 0;
+        tw.writeAll(name) catch return 0;
+        tw.writeByte('"') catch return 0;
+
+        var iter = input.iterator();
+        while (iter.next()) |entry| {
+            tw.writeAll(",\"") catch return 0;
+            tw.writeAll(entry.key_ptr.*) catch return 0;
+            tw.writeAll("\":") catch return 0;
+            writeJsonVal(tw, entry.value_ptr.*) catch return 0;
+        }
+
+        tw.writeByte('}') catch return 0;
+        return fbs.getWritten().len;
+    }
+
+    /// Serialize a std.json.Value to JSON text (for tool_use reconstruction).
+    fn writeJsonVal(tw: anytype, value: std.json.Value) !void {
+        switch (value) {
+            .string => |s| {
+                try tw.writeByte('"');
+                try writeJsonEscapedString(tw, s);
+                try tw.writeByte('"');
+            },
+            .integer => |i| try tw.print("{d}", .{i}),
+            .float => |f| try tw.print("{d}", .{f}),
+            .bool => |b| try tw.writeAll(if (b) "true" else "false"),
+            .null => try tw.writeAll("null"),
+            .number_string => |s| try tw.writeAll(s),
+            .array, .object => try tw.writeAll("null"),
+        }
+    }
+
     fn doRequest(self: *Self, request: ChatRequest) !ChatResult {
         var client = http.Client{ .allocator = self.allocator };
         defer client.deinit();
@@ -635,7 +879,22 @@ pub const AnthropicClient = struct {
         var fbs = std.io.fixedBufferStream(json_buf);
         const writer = fbs.writer();
 
-        try writer.print("{{\"model\":\"{s}\",\"max_tokens\":{d},\"messages\":[", .{ request.model, MAX_TOKENS });
+        try writer.print("{{\"model\":\"{s}\",\"max_tokens\":{d}", .{ request.model, MAX_TOKENS });
+
+        // Optional system prompt (for canvas-enabled conversations).
+        if (request.system) |sys| {
+            try writer.writeAll(",\"system\":\"");
+            try writeJsonEscapedString(writer, sys);
+            try writer.writeByte('"');
+        }
+
+        // Optional tools array (comptime-generated Anthropic format).
+        if (request.tools_json) |tools| {
+            try writer.writeAll(",\"tools\":");
+            try writer.writeAll(tools);
+        }
+
+        try writer.writeAll(",\"messages\":[");
 
         // Add conversation history
         var first = true;

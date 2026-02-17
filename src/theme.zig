@@ -173,8 +173,8 @@ pub fn get(is_dark_mode: bool) Theme {
 // Glass Background Colors (for window configuration)
 // =============================================================================
 
-pub const glass_light = Color.init(0.96, 0.96, 0.97, 1.0);
-pub const glass_dark = Color.init(0.12, 0.12, 0.14, 1.0);
+pub const glass_light = Color.rgba(0.96, 0.96, 0.97, 1.0);
+pub const glass_dark = Color.rgba(0.12, 0.12, 0.14, 1.0);
 
 pub fn getGlassColor(is_dark_mode: bool) Color {
     return if (is_dark_mode) glass_dark else glass_light;

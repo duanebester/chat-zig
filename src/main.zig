@@ -34,11 +34,11 @@ fn onEvent(cx: *gooey.Cx, event: gooey.InputEvent) bool {
 }
 
 const App = gooey.App(AppState, &state, layout.render, .{
-    .title = "ChatAI",
-    .width = 500,
+    .title = "ChatAI + Canvas",
+    .width = 1100,
     .height = 700,
     // Dark background for glass effect (app starts in dark mode)
-    .background_color = gooey.Color.init(0.14, 0.14, 0.16, 0.7),
+    .background_color = gooey.Color.rgba(0.14, 0.14, 0.16, 0.7),
     // Semi-transparent background
     .background_opacity = 0.7,
     // Enable glass effect
@@ -47,6 +47,8 @@ const App = gooey.App(AppState, &state, layout.render, .{
     // Transparent titlebar for seamless look
     .titlebar_transparent = true,
     .full_size_content = true,
+    // Lifecycle
+    .init = AppState.init,
     // Handle global keyboard shortcuts
     .on_event = onEvent,
 });

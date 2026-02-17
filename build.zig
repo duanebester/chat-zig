@@ -22,18 +22,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    exe.linkLibC();
-
+    // Gooey's module links macOS frameworks (AppKit, Metal, CoreText, etc.)
+    // transitively — no manual linkFramework ceremony needed here.
+    // Security is consumer-specific: std.http needs it for TLS on macOS.
     if (target.result.os.tag == .macos) {
-        exe.linkFramework("Cocoa");
-        exe.linkFramework("Metal");
-        exe.linkFramework("MetalKit");
-        exe.linkFramework("QuartzCore");
-        exe.linkFramework("CoreText");
-        exe.linkFramework("CoreGraphics");
-        exe.linkFramework("CoreFoundation");
-        exe.linkFramework("Foundation");
-        exe.linkFramework("AppKit");
         exe.linkFramework("Security");
     }
 
