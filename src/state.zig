@@ -4,8 +4,20 @@
 //! - Message history
 //! - Input text binding
 //! - File attachments via native file dialog
-//! - Async API communication (TigersEye pattern: pending fields + dispatch)
-//! - Thread dispatch for UI updates
+//! - Async API communication via `std.Io.Group` + `Io.Queue` (Zig 0.16)
+//! - Result delivery: the render loop drains the queue each frame
+//!
+//! Zig 0.16 migration notes:
+//!   - Replaced `std.Thread.spawn` + `dispatchOnMainThread` with
+//!     `Io.Group.async` + `Io.Queue(WorkerResult)`. Workers push typed
+//!     results into the queue; the render loop drains them without blocking.
+//!     This eliminates the per-request heap allocations (Task, Context) and
+//!     the two-hop trampoline (bg → dispatch → main) in favour of one
+//!     bounded channel.
+//!   - Filesystem reads, HTTP, TLS, and env lookups all thread through the
+//!     single `std.Io` instance published by `main` (via `std.process.Init`).
+//!   - `io_group` is registered with Gooey so that window close cancels any
+//!     in-flight HTTP work cleanly — no use-after-free on shutdown.
 
 const std = @import("std");
 const log = std.log.scoped(.chatzig);
@@ -17,8 +29,13 @@ const canvas_state = @import("canvas_state.zig");
 const canvas_tools = @import("canvas_tools.zig");
 const VirtualListState = gooey.VirtualListState;
 
+// Reach back into `main` for the process-global Io + environ published from
+// `std.process.Init`. `AppState.init` needs both but only receives a `*Cx`,
+// so rather than thread them through every call we publish them on main.
+const main_mod = @import("main.zig");
+
 // =============================================================================
-// Constants (per CLAUDE.md: "Put a limit on everything")
+// Constants (CLAUDE rule #4: put a limit on everything)
 // =============================================================================
 
 pub const MAX_MESSAGES: usize = 256;
@@ -28,6 +45,13 @@ pub const DEFAULT_MESSAGE_HEIGHT: f32 = 60.0;
 pub const MAX_RESPONSE_LEN: usize = 32768;
 pub const MAX_FILE_PATH_LEN: usize = 512;
 pub const MAX_ATTACHED_FILENAME_LEN: usize = 128;
+
+/// Max worker results buffered between render frames. With `is_loading`
+/// guarding single-flight requests, only one result is ever in flight at a
+/// time; 8 is generous headroom for future parallelism (e.g. background
+/// thumbnail fetch) and keeps the backing array small
+/// (`8 * @sizeOf(WorkerResult)`).
+pub const RESULT_QUEUE_CAPACITY: usize = 8;
 
 // =============================================================================
 // Model Selection
@@ -75,7 +99,7 @@ pub const Message = struct {
     role: MessageRole,
     content: [MAX_MESSAGE_LEN]u8 = undefined,
     content_len: usize = 0,
-    /// Optional attached file name (just the filename, not full path)
+    /// Optional attached file name (just the filename, not full path).
     attached_file: [MAX_ATTACHED_FILENAME_LEN]u8 = undefined,
     attached_file_len: usize = 0,
     cached_height: f32 = 0.0,
@@ -124,20 +148,29 @@ pub const Message = struct {
 };
 
 // =============================================================================
-// API Result (from HTTP thread, TigersEye pattern)
+// Worker Result (delivered via std.Io.Queue from async tasks)
 // =============================================================================
 
-pub const ApiResult = union(enum) {
-    success: SuccessResult,
-    err: ErrorResult,
+pub const SuccessResult = struct {
+    response_len: usize,
+};
 
-    pub const SuccessResult = struct {
-        response_len: usize,
-    };
+pub const ErrorResult = struct {
+    /// Static lifetime — either a compile-time string or a pointer into a
+    /// long-lived owned buffer on `http.ChatResult`. The queue never copies
+    /// the bytes; it only carries the slice header.
+    message: []const u8,
+};
 
-    pub const ErrorResult = struct {
-        message: []const u8,
-    };
+/// Tagged union over every kind of worker outcome so a single `Io.Queue` can
+/// carry either chat or canvas results. The render loop switches on the tag
+/// and applies the matching staging buffer.
+///
+/// Keep this small: it is copied into the queue's ring buffer by value.
+pub const WorkerResult = union(enum) {
+    chat_success: SuccessResult,
+    chat_error: ErrorResult,
+    canvas: http.CanvasResult,
 };
 
 // =============================================================================
@@ -167,16 +200,9 @@ pub const AppState = struct {
     is_loading: bool = false,
     has_api_key: bool = false,
     error_message: ?[]const u8 = null,
-    dark_mode: bool = true, // Start in dark mode like the reference image
+    dark_mode: bool = true, // Start in dark mode like the reference image.
 
-    // =========================================================================
-    // Canvas State
-    // =========================================================================
     canvas_enabled: bool = false,
-
-    // =========================================================================
-    // Model Selection State
-    // =========================================================================
     selected_model: Model = .haiku,
 
     // =========================================================================
@@ -187,33 +213,60 @@ pub const AppState = struct {
     has_attached_file: bool = false,
 
     // =========================================================================
-    // HTTP Client (pure, no framework deps)
+    // HTTP Client (borrows `std.Io` from main)
     // =========================================================================
     http_client: ?http.AnthropicClient = null,
 
     // =========================================================================
-    // Pending API Result (TigersEye pattern: staging area from IO thread)
+    // Staging Buffers (written by worker, read by render after queue drain)
     // =========================================================================
-    pending_result: ?ApiResult = null,
+    //
+    // Threading invariant: these buffers are written ONLY by a worker fiber,
+    // and ONLY before it calls `queue.putOne`. They are read ONLY by the
+    // render thread, and ONLY after `cx.drainQueue` returns the matching
+    // `WorkerResult`. The queue's internal synchronization provides the
+    // happens-before edge that makes the writes visible.
+    //
+    // This is the same discipline as the pre-0.16 "TigersEye" pattern, but
+    // without the dispatcher trampoline — the queue IS the synchronization.
+
     pending_response_buf: [MAX_RESPONSE_LEN]u8 = undefined,
     pending_response_len: usize = 0,
 
-    // Pending file path for worker thread
     pending_file_path: [MAX_FILE_PATH_LEN]u8 = undefined,
     pending_file_path_len: usize = 0,
 
-    // =========================================================================
-    // Pending Canvas Result (staging area from IO thread)
-    // =========================================================================
     pending_canvas_lines: [canvas_state.MAX_CANVAS_BUF]u8 = undefined,
     pending_canvas_lines_len: usize = 0,
     pending_canvas_text: [MAX_RESPONSE_LEN]u8 = undefined,
     pending_canvas_text_len: usize = 0,
-    pending_canvas_result: ?http.CanvasResult = null,
 
     // =========================================================================
-    // Threading
+    // Async Result Plumbing — Zig 0.16 std.Io
     // =========================================================================
+    //
+    // `io_group` tracks every background fiber launched by `sendMessage`. It
+    // is registered with Gooey on init, so window close cancels all in-flight
+    // work before AppState is torn down — no dangling pointers from a worker
+    // into freed state.
+    //
+    // `result_queue` carries `WorkerResult` values from worker → render. The
+    // backing storage lives inline on AppState (`RESULT_QUEUE_CAPACITY`
+    // slots); the queue object holds a pointer into it, so AppState must not
+    // be moved after `init` runs.
+
+    io_group: std.Io.Group = .init,
+    result_buffer: [RESULT_QUEUE_CAPACITY]WorkerResult = undefined,
+    result_queue: std.Io.Queue(WorkerResult) = undefined,
+
+    // =========================================================================
+    // Framework handles
+    // =========================================================================
+    //
+    // `gooey_ptr` is retained (despite the dispatcher going away) so workers
+    // can nudge the event loop via `g.requestRender()` — that call is
+    // threadsafe by contract and does not touch any shared state, it just
+    // wakes the run loop so the next frame drains the queue.
     gooey_ptr: ?*gooey.Gooey = null,
 
     // =========================================================================
@@ -225,15 +278,31 @@ pub const AppState = struct {
         const g = cx.gooey();
         self.gooey_ptr = g;
 
-        // Set initial window appearance based on dark_mode state
+        // Set initial window appearance from the persisted dark_mode flag.
         g.setAppearance(self.dark_mode);
 
-        // Check for API key
-        const api_key = std.posix.getenv("ANTHROPIC_API_KEY");
+        // Wire up the async plumbing. The queue is built in place; its
+        // backing buffer already lives at its final address on AppState (we
+        // are past the stack→heap move because `init` is called on the
+        // mounted, committed state pointer).
+        self.result_queue = std.Io.Queue(WorkerResult).init(&self.result_buffer);
+        cx.registerCancelGroup(&self.io_group);
+
+        // Look up the API key through the environ published by `main`. On
+        // macOS this replaces libc's `getenv`, which `std.posix` no longer
+        // wraps in 0.16.
+        const api_key = main_mod.process_env.getPosix("ANTHROPIC_API_KEY");
         self.has_api_key = api_key != null and api_key.?.len > 0;
 
         if (self.has_api_key) {
-            self.http_client = http.AnthropicClient.init(api_key.?, std.heap.page_allocator);
+            // AnthropicClient holds `std.Io` so it can spin up `http.Client`
+            // per request. `page_allocator` is threadsafe and thus safe to
+            // hand to a fiber that runs on a worker thread.
+            self.http_client = http.AnthropicClient.init(
+                api_key.?,
+                std.heap.page_allocator,
+                main_mod.process_io,
+            );
             log.info("Anthropic API key found", .{});
         } else {
             log.warn("ANTHROPIC_API_KEY not set", .{});
@@ -249,65 +318,70 @@ pub const AppState = struct {
         std.debug.assert(self.message_head < MAX_MESSAGES);
 
         if (self.message_count < MAX_MESSAGES) {
-            const insert_index = (self.message_head + self.message_count) % MAX_MESSAGES;
-            self.messages[insert_index] = msg;
+            self.messages[(self.message_head + self.message_count) % MAX_MESSAGES] = msg;
             self.message_count += 1;
         } else {
-            const overwrite_index = self.message_head;
-            self.messages[overwrite_index] = msg;
+            // Ring-buffer overflow: overwrite the oldest message.
+            self.messages[self.message_head] = msg;
             self.message_head = (self.message_head + 1) % MAX_MESSAGES;
-            self.message_count = MAX_MESSAGES;
         }
 
-        // Update list state
-        self.list_state.setItemCount(@intCast(self.message_count));
+        // Freshly-added messages start with no cached height. Being explicit
+        // here guards against a caller constructing `msg` with a stale value.
+        const tail_idx = if (self.message_count == 0)
+            self.message_head
+        else
+            (self.message_head + self.message_count - 1) % MAX_MESSAGES;
+        self.messages[tail_idx].cached_height = 0.0;
 
-        // Scroll to bottom
+        // Keep the virtual list in sync with the message ring, and scroll so
+        // the freshly-added message is visible. These are UI-side mutations
+        // that live on the same thread as the caller (main thread — callers
+        // are either `sendMessage` or the render-loop drain).
+        self.list_state.setItemCount(@intCast(self.message_count));
         self.list_state.scrollToBottom();
     }
 
-    pub fn getMessage(self: *const Self, index: usize) ?*const Message {
-        std.debug.assert(self.message_count <= MAX_MESSAGES);
-        std.debug.assert(self.message_head < MAX_MESSAGES);
-        if (index >= self.message_count) return null;
-        const physical_index = (self.message_head + index) % MAX_MESSAGES;
-        return &self.messages[physical_index];
+    pub fn getMessage(self: *const Self, i: usize) ?*const Message {
+        if (i >= self.message_count) return null;
+        std.debug.assert(i < MAX_MESSAGES);
+        const idx = (self.message_head + i) % MAX_MESSAGES;
+        return &self.messages[idx];
     }
 
-    pub fn getMessageCachedHeight(self: *const Self, index: usize) f32 {
-        std.debug.assert(self.message_count <= MAX_MESSAGES);
-        if (index >= self.message_count) return 0.0;
-        const physical_index = (self.message_head + index) % MAX_MESSAGES;
-        return self.messages[physical_index].cached_height;
+    pub fn getMessageCachedHeight(self: *const Self, i: usize) f32 {
+        if (i >= self.message_count) return 0.0;
+        std.debug.assert(i < MAX_MESSAGES);
+        const idx = (self.message_head + i) % MAX_MESSAGES;
+        return self.messages[idx].cached_height;
     }
 
-    pub fn setMessageCachedHeight(self: *Self, index: usize, height: f32) void {
-        std.debug.assert(self.message_count <= MAX_MESSAGES);
-        std.debug.assert(index < self.message_count);
-        std.debug.assert(height >= 0.0);
-        const physical_index = (self.message_head + index) % MAX_MESSAGES;
-        self.messages[physical_index].cached_height = height;
+    pub fn setMessageCachedHeight(self: *Self, i: usize, h: f32) void {
+        if (i >= self.message_count) return;
+        std.debug.assert(i < MAX_MESSAGES);
+        const idx = (self.message_head + i) % MAX_MESSAGES;
+        self.messages[idx].cached_height = h;
     }
 
     pub fn invalidateCachedHeights(self: *Self) void {
-        std.debug.assert(self.message_count <= MAX_MESSAGES);
-        std.debug.assert(self.message_head < MAX_MESSAGES);
-        for (0..self.message_count) |i| {
-            const physical_index = (self.message_head + i) % MAX_MESSAGES;
-            self.messages[physical_index].cached_height = 0.0;
+        var i: usize = 0;
+        while (i < self.message_count) : (i += 1) {
+            const idx = (self.message_head + i) % MAX_MESSAGES;
+            self.messages[idx].cached_height = 0.0;
         }
     }
 
     pub fn clearMessages(self: *Self) void {
-        std.debug.assert(self.message_count <= MAX_MESSAGES);
-        self.message_head = 0;
         self.message_count = 0;
+        self.message_head = 0;
+        self.error_message = null;
+        self.is_loading = false;
         self.list_state.setItemCount(0);
         self.list_state.scrollToTop();
     }
 
     // =========================================================================
-    // Build Chat Request from State
+    // Chat Request Assembly
     // =========================================================================
 
     const ChatMessagesBuffer = struct {
@@ -315,20 +389,22 @@ pub const AppState = struct {
         count: usize = 0,
     };
 
-    fn buildChatRequest(self: *const Self, buf: *ChatMessagesBuffer) http.ChatRequest {
+    fn buildChatRequest(self: *Self, buf: *ChatMessagesBuffer) http.ChatRequest {
+        // Snapshot the ring buffer into a contiguous slice of ChatMessages.
+        // Called from the worker fiber, but `is_loading` guards single-flight
+        // so the main thread cannot mutate `messages` concurrently.
         buf.count = 0;
-
-        for (0..self.message_count) |i| {
-            const msg = self.getMessage(i) orelse unreachable;
-            if (msg.role == .system) continue;
-
-            buf.messages[buf.count] = .{
-                .role = if (msg.role == .user) .user else .assistant,
-                .content = msg.getText(),
+        var i: usize = 0;
+        while (i < self.message_count and buf.count < MAX_MESSAGES) : (i += 1) {
+            const msg = self.getMessage(i) orelse break;
+            const role: http.ChatRole = switch (msg.role) {
+                .user => .user,
+                .assistant => .assistant,
+                .system => continue, // Anthropic takes system via a separate field.
             };
+            buf.messages[buf.count] = http.ChatMessage.text(role, msg.getText());
             buf.count += 1;
         }
-
         return .{
             .model = self.selected_model.apiName(),
             .messages = buf.messages[0..buf.count],
@@ -336,36 +412,40 @@ pub const AppState = struct {
     }
 
     // =========================================================================
-    // Send Message (command handler - takes *gooey.Gooey)
+    // Send Message — launches an async worker via Io.Group
     // =========================================================================
 
     pub fn sendMessage(self: *Self, g: *gooey.Gooey) void {
         self.gooey_ptr = g;
 
-        // Get input text
         if (self.input_slice.len == 0) return;
-
-        // Don't send if already loading
+        // Single-flight: swallow a second click while the first request is
+        // still outstanding. This is also what keeps the worker's snapshot
+        // read of `messages` race-free (see `buildChatRequest`).
         if (self.is_loading) return;
 
-        // Capture attached file path before clearing (copy to pending buffer)
+        // Capture the attached file path before clearing, so the worker
+        // fiber reads from a stable staging slot rather than the live input
+        // slot (which the next user action could mutate).
         var attached_path_len: usize = 0;
         if (self.has_attached_file) {
             attached_path_len = self.attached_file_path_len;
-            @memcpy(self.pending_file_path[0..attached_path_len], self.attached_file_path[0..attached_path_len]);
+            @memcpy(
+                self.pending_file_path[0..attached_path_len],
+                self.attached_file_path[0..attached_path_len],
+            );
         }
 
-        // Add user message (with optional file attachment)
+        // Add the user's message to the visible history.
         if (self.has_attached_file) {
             self.addMessage(Message.userWithFile(self.input_slice, self.getAttachedFileName()));
         } else {
             self.addMessage(Message.user(self.input_slice));
         }
 
-        // Store attached file path for worker thread
         self.pending_file_path_len = attached_path_len;
 
-        // Clear input and attachment
+        // Clear input + attachment from the UI.
         self.input_slice = "";
         if (g.textArea("chat-input")) |ta| {
             ta.clear();
@@ -373,11 +453,9 @@ pub const AppState = struct {
         self.has_attached_file = false;
         self.attached_file_path_len = 0;
 
-        // Set loading state
         self.is_loading = true;
         self.error_message = null;
 
-        // Check for client
         if (self.http_client == null) {
             self.error_message = "No API key configured";
             self.is_loading = false;
@@ -385,48 +463,48 @@ pub const AppState = struct {
             return;
         }
 
-        // Spawn worker thread — canvas or normal path
+        // Launch the worker on the shared Io instance. The group owns the
+        // task — cancellation on window close unwinds it cleanly. Worker
+        // functions take only primitives + pointers, never a `self` style
+        // receiver, so the Io runtime can cache arguments in registers
+        // (CLAUDE rule 20 — "Hot Loop Extraction" applied to the fiber
+        // entry point).
+        const io = main_mod.process_io;
         if (self.canvas_enabled) {
-            const thread = std.Thread.spawn(.{}, canvasWorker, .{
+            self.io_group.async(io, canvasWorker, .{
+                io,
                 &self.http_client.?,
                 self,
-            }) catch |err| {
-                log.err("Failed to spawn canvas thread: {}", .{err});
-                self.error_message = "Failed to send message";
-                self.is_loading = false;
-                g.requestRender();
-                return;
-            };
-            thread.detach();
+                &self.result_queue,
+            });
         } else {
-            const thread = std.Thread.spawn(.{}, httpWorker, .{
+            self.io_group.async(io, httpWorker, .{
+                io,
                 &self.http_client.?,
                 self,
-            }) catch |err| {
-                log.err("Failed to spawn HTTP thread: {}", .{err});
-                self.error_message = "Failed to send message";
-                self.is_loading = false;
-                g.requestRender();
-                return;
-            };
-            thread.detach();
+                &self.result_queue,
+            });
         }
 
         g.requestRender();
     }
 
     // =========================================================================
-    // HTTP Worker Thread (TigersEye pattern)
+    // Workers — run on an Io fiber, off the main thread
     // =========================================================================
 
-    fn httpWorker(client: *http.AnthropicClient, app: *Self) void {
-        // Build request from current state
-        // Note: This reads app state from worker thread, but message_count and
-        // messages are only written from main thread before spawning this worker
+    /// Chat worker: builds the request, blocks on the HTTP call, writes the
+    /// response text into `pending_response_buf`, and signals completion via
+    /// the result queue. Never touches UI state directly.
+    fn httpWorker(
+        io: std.Io,
+        client: *http.AnthropicClient,
+        app: *Self,
+        queue: *std.Io.Queue(WorkerResult),
+    ) void {
         var buf: ChatMessagesBuffer = .{};
         const request = app.buildChatRequest(&buf);
 
-        // Execute blocking HTTP request (with or without file attachment)
         var result: http.ChatResult = undefined;
         if (app.pending_file_path_len > 0) {
             const file_path = app.pending_file_path[0..app.pending_file_path_len];
@@ -437,32 +515,41 @@ pub const AppState = struct {
         }
         defer result.deinit(client.allocator);
 
-        // Copy result to pending staging area
-        switch (result.status) {
-            .success => |text| {
+        // Copy text into the staging buffer BEFORE pushing to the queue.
+        // `putOne` is the happens-before edge — the main thread observes
+        // these writes only after it drains the matching result.
+        const outcome: WorkerResult = switch (result.status) {
+            .success => |text| blk: {
                 const len = @min(text.len, MAX_RESPONSE_LEN);
                 @memcpy(app.pending_response_buf[0..len], text[0..len]);
                 app.pending_response_len = len;
-                app.pending_result = .{ .success = .{ .response_len = len } };
+                break :blk .{ .chat_success = .{ .response_len = len } };
             },
-            .err => |msg| {
-                app.pending_result = .{ .err = .{ .message = msg } };
-            },
-        }
+            .err => |msg| WorkerResult{ .chat_error = .{ .message = msg } },
+        };
 
-        // Dispatch to main thread
-        app.dispatchToMain();
+        queue.putOne(io, outcome) catch |e| {
+            // Queue closed (teardown) or task cancelled (group cancelled):
+            // the main thread is already tearing down, so drop the result.
+            log.debug("httpWorker: result dropped ({t})", .{e});
+        };
+
+        // Poke the main thread so it runs a render and drains the queue.
+        // Without this, the frame may not fire until the next input event.
+        app.requestRenderFromWorker();
     }
 
-    // =========================================================================
-    // Canvas Worker Thread (tool-use path)
-    // =========================================================================
-
-    fn canvasWorker(client: *http.AnthropicClient, app: *Self) void {
+    /// Canvas worker: same shape as `httpWorker`, but with tool-use parsing.
+    /// Writes parsed draw commands + text into the canvas staging buffers.
+    fn canvasWorker(
+        io: std.Io,
+        client: *http.AnthropicClient,
+        app: *Self,
+        queue: *std.Io.Queue(WorkerResult),
+    ) void {
         var buf: ChatMessagesBuffer = .{};
         var request = app.buildChatRequest(&buf);
 
-        // Attach canvas system prompt and tools to the request.
         request.system = canvas_tools.canvas_system_prompt;
         request.tools_json = canvas_tools.anthropic_tools_json;
 
@@ -474,82 +561,66 @@ pub const AppState = struct {
             &app.pending_canvas_text,
         );
 
-        if (result.has_error) {
-            app.pending_result = .{ .err = .{ .message = result.error_message } };
-            app.pending_canvas_result = null;
-        } else {
+        // On success, publish the lengths alongside the already-written
+        // staging buffers. On error, the staging lengths are irrelevant —
+        // `applyCanvasResult` short-circuits on `has_error`.
+        if (!result.has_error) {
             app.pending_canvas_lines_len = result.canvas_lines_len;
             app.pending_canvas_text_len = result.text_len;
-            app.pending_canvas_result = result;
-            app.pending_result = null; // Canvas path uses its own result
         }
 
-        app.dispatchToMain();
-    }
-
-    // =========================================================================
-    // Thread Dispatch (TigersEye pattern)
-    // =========================================================================
-
-    const DispatchCtx = struct { app: *Self };
-
-    pub fn dispatchToMain(self: *Self) void {
-        const g = self.gooey_ptr orelse {
-            log.warn("dispatchToMain: no Gooey pointer", .{});
-            return;
+        queue.putOne(io, .{ .canvas = result }) catch |e| {
+            log.debug("canvasWorker: result dropped ({t})", .{e});
         };
 
-        g.dispatchOnMainThread(
-            DispatchCtx,
-            .{ .app = self },
-            dispatchHandler,
-        ) catch {
-            log.warn("dispatchToMain: dispatch failed", .{});
-        };
+        app.requestRenderFromWorker();
     }
 
-    fn dispatchHandler(ctx: *DispatchCtx) void {
-        const s = ctx.app;
-        const g = s.gooey_ptr orelse return;
-
-        // Apply pending canvas result if present (canvas path)
-        if (s.pending_canvas_result) |cr| {
-            s.applyCanvasResult(cr);
-            s.pending_canvas_result = null;
-        }
-
-        // Apply pending result if present (normal path)
-        if (s.pending_result) |result| {
-            s.applyResult(result);
-            s.pending_result = null;
-        }
-
+    /// Request a render from a worker fiber. Safe to call from any thread —
+    /// `Gooey.requestRender` is threadsafe by contract and only nudges the
+    /// event loop; the actual result delivery still flows through the
+    /// Io.Queue drain on the main thread.
+    fn requestRenderFromWorker(self: *Self) void {
+        const g = self.gooey_ptr orelse return;
         g.requestRender();
     }
 
     // =========================================================================
-    // Apply Result (TigersEye pattern - main thread only)
+    // Render-loop Drain — apply pending results on the main thread
     // =========================================================================
 
-    fn applyResult(self: *Self, result: ApiResult) void {
-        switch (result) {
-            .success => |r| {
-                // Add assistant message from staging buffer
-                const response = self.pending_response_buf[0..r.response_len];
-                self.addMessage(Message.assistant(response));
-                self.error_message = null;
-            },
-            .err => |e| {
-                self.error_message = e.message;
-            },
+    /// Drain the result queue and apply any completed worker outputs. Call
+    /// this at the top of the render function, before anything reads
+    /// `is_loading` or iterates `messages`.
+    ///
+    /// Non-blocking: returns immediately if the queue is empty. The internal
+    /// buffer is sized to match `RESULT_QUEUE_CAPACITY` so a single drain
+    /// cannot leave backlog.
+    pub fn drainResults(self: *Self, cx: *gooey.Cx) void {
+        var buf: [RESULT_QUEUE_CAPACITY]WorkerResult = undefined;
+        const drained = cx.drainQueue(WorkerResult, &self.result_queue, &buf);
+        std.debug.assert(drained.len <= RESULT_QUEUE_CAPACITY);
+        for (drained) |r| {
+            switch (r) {
+                .chat_success => |ok| self.applyChatSuccess(ok),
+                .chat_error => |err| self.applyChatError(err),
+                .canvas => |cr| self.applyCanvasResult(cr),
+            }
         }
+    }
 
+    fn applyChatSuccess(self: *Self, r: SuccessResult) void {
+        std.debug.assert(r.response_len <= MAX_RESPONSE_LEN);
+        const response = self.pending_response_buf[0..r.response_len];
+        self.addMessage(Message.assistant(response));
+        self.error_message = null;
         self.is_loading = false;
     }
 
-    // =========================================================================
-    // Apply Canvas Result (main thread only)
-    // =========================================================================
+    fn applyChatError(self: *Self, e: ErrorResult) void {
+        self.error_message = e.message;
+        self.is_loading = false;
+    }
 
     fn applyCanvasResult(self: *Self, result: http.CanvasResult) void {
         if (result.has_error) {
@@ -558,7 +629,7 @@ pub const AppState = struct {
             return;
         }
 
-        // Clear canvas for fresh batch, then process command lines.
+        // Clear the canvas for a fresh batch, then replay the commands.
         canvas_state.clearCanvas();
         if (result.canvas_lines_len > 0) {
             const lines = self.pending_canvas_lines[0..result.canvas_lines_len];
@@ -566,12 +637,13 @@ pub const AppState = struct {
             log.info("Canvas: applied {d} draw commands", .{count});
         }
 
-        // Show any text response from the LLM in the chat.
+        // Surface any text response from the LLM in the chat history. If the
+        // model replied with only tool calls, drop a short breadcrumb so the
+        // user sees SOMETHING scroll past.
         if (result.text_len > 0) {
             const text = self.pending_canvas_text[0..result.text_len];
             self.addMessage(Message.assistant(text));
         } else if (result.canvas_lines_len > 0) {
-            // If only tool calls, add a minimal confirmation message.
             self.addMessage(Message.assistant("(drew on canvas)"));
         }
 
@@ -580,7 +652,7 @@ pub const AppState = struct {
     }
 
     // =========================================================================
-    // Theme Toggle
+    // Theme / Canvas / Model Toggles
     // =========================================================================
 
     pub fn toggleDarkMode(self: *Self, g: *gooey.Gooey) void {
@@ -589,17 +661,9 @@ pub const AppState = struct {
         g.requestRender();
     }
 
-    // =========================================================================
-    // Canvas Toggle
-    // =========================================================================
-
     pub fn toggleCanvas(self: *Self, _: *gooey.Gooey) void {
         self.canvas_enabled = !self.canvas_enabled;
     }
-
-    // =========================================================================
-    // Model Selection Handlers
-    // =========================================================================
 
     pub fn selectModel(self: *Self, index: usize) void {
         self.selected_model = @enumFromInt(index);
@@ -611,8 +675,9 @@ pub const AppState = struct {
 
     pub fn openFileDialog(self: *Self, g: *gooey.Gooey) void {
         _ = self;
-        // Defer to avoid deadlock - file dialog blocks and processes events
-        // which can trigger input handlers while render mutex is held
+        // Defer to avoid deadlock — the native file dialog blocks and
+        // processes events, which can re-enter input handlers while the
+        // render mutex is held.
         g.deferCommand(Self.openFileDialogDeferred);
     }
 
@@ -625,7 +690,7 @@ pub const AppState = struct {
             .multiple = false,
             .prompt = "Attach",
             .message = "Select a file to attach",
-            // Supported file types: images (base64), text files (inline), and PDFs (via Files API)
+            // Supported file types: images (base64), text files (inline), PDFs (Files API).
             .allowed_extensions = &.{ "txt", "md", "json", "csv", "png", "jpg", "jpeg", "gif", "webp", "pdf" },
         })) |result| {
             defer result.deinit();
@@ -653,7 +718,7 @@ pub const AppState = struct {
 
     pub fn getAttachedFileName(self: *const Self) []const u8 {
         const path = self.getAttachedFilePath();
-        // Find the last '/' to extract just the filename
+        // Find the last '/' to extract just the filename.
         var last_slash: usize = 0;
         for (path, 0..) |c, i| {
             if (c == '/') last_slash = i + 1;

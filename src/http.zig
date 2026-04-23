@@ -21,6 +21,7 @@ const std = @import("std");
 const log = std.log.scoped(.chatzig);
 const http = std.http;
 const Uri = std.Uri;
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 // =============================================================================
@@ -179,8 +180,12 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// Read a file and prepare it as an attachment
-pub fn readFileAttachment(allocator: Allocator, path: []const u8) !FileAttachment {
+/// Read a file and prepare it as an attachment.
+///
+/// Zig 0.16 note: filesystem access now flows through `std.Io` — `Dir`, `File`,
+/// and `File.Reader` all require an `Io` instance. We take one here rather than
+/// reaching for a global; the caller (AnthropicClient) already owns one.
+pub fn readFileAttachment(io: Io, allocator: Allocator, path: []const u8) !FileAttachment {
     const mime_type = getMimeType(path);
 
     // Check if file type is supported
@@ -189,13 +194,13 @@ pub fn readFileAttachment(allocator: Allocator, path: []const u8) !FileAttachmen
         return error.UnsupportedFileType;
     }
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch |e| {
+    const file = Io.Dir.openFileAbsolute(io, path, .{}) catch |e| {
         log.err("Failed to open file {s}: {}", .{ path, e });
         return error.FileOpenFailed;
     };
-    defer file.close();
+    defer file.close(io);
 
-    const stat = file.stat() catch |e| {
+    const stat = file.stat(io) catch |e| {
         log.err("Failed to stat file: {}", .{e});
         return error.FileStatFailed;
     };
@@ -205,7 +210,16 @@ pub fn readFileAttachment(allocator: Allocator, path: []const u8) !FileAttachmen
         return error.FileTooLarge;
     }
 
-    const content = file.readToEndAlloc(allocator, MAX_FILE_SIZE) catch |e| {
+    // Drain the file through a `File.Reader` into an allocated buffer, bounded
+    // by MAX_FILE_SIZE. The 4 KiB stack buffer is the transfer window used by
+    // the Reader's internal `drain`/`read` implementation — it is not an upper
+    // bound on the returned slice.
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    const content = file_reader.interface.allocRemaining(
+        allocator,
+        Io.Limit.limited(MAX_FILE_SIZE),
+    ) catch |e| {
         log.err("Failed to read file: {}", .{e});
         return error.FileReadFailed;
     };
@@ -322,11 +336,17 @@ pub const FileUploadResult = struct {
 
 /// Upload a file to the Anthropic Files API (required for PDFs)
 /// Returns a FileUploadResult containing the file_id on success
-pub fn uploadFileToFilesApi(allocator: Allocator, api_key: []const u8, attachment: FileAttachment) FileUploadResult {
+pub fn uploadFileToFilesApi(
+    io: Io,
+    allocator: Allocator,
+    api_key: []const u8,
+    attachment: FileAttachment,
+) FileUploadResult {
     std.debug.assert(api_key.len > 0);
     std.debug.assert(attachment.content.len > 0);
 
-    var client = http.Client{ .allocator = allocator };
+    // Zig 0.16: http.Client now carries an Io instance for DNS, TCP, and TLS.
+    var client = http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     // Build multipart form data
@@ -347,25 +367,26 @@ pub fn uploadFileToFilesApi(allocator: Allocator, api_key: []const u8, attachmen
     };
     defer allocator.free(body_buf);
 
-    var fbs = std.io.fixedBufferStream(body_buf);
-    const writer = fbs.writer();
+    // Zig 0.16 replaced `std.io.fixedBufferStream` with `Io.Writer.fixed`.
+    // The Writer exposes `buffered()` to retrieve the filled slice.
+    var fbs: Io.Writer = .fixed(body_buf);
 
     // Write multipart header
-    writer.print(header_template, .{ boundary, file_name, attachment.media_type }) catch {
+    fbs.print(header_template, .{ boundary, file_name, attachment.media_type }) catch {
         return FileUploadResult.err("Failed to write multipart header");
     };
 
     // Write file content
-    writer.writeAll(attachment.content) catch {
+    fbs.writeAll(attachment.content) catch {
         return FileUploadResult.err("Failed to write file content");
     };
 
     // Write footer
-    writer.writeAll(footer) catch {
+    fbs.writeAll(footer) catch {
         return FileUploadResult.err("Failed to write multipart footer");
     };
 
-    const body = fbs.getWritten();
+    const body = fbs.buffered();
     if (LOG_PAYLOADS) {
         log.debug("Files API upload: {d} bytes for {s}", .{ body.len, file_name });
     }
@@ -397,8 +418,10 @@ pub fn uploadFileToFilesApi(allocator: Allocator, api_key: []const u8, attachmen
     };
     defer req.deinit();
 
-    // Send body
-    req.transfer_encoding = .{ .content_length = body.len };
+    // Send body. In Zig 0.16, `sendBodyComplete` sets `transfer_encoding`
+    // internally from `body.len`; the explicit assignment is no longer needed.
+    // Note: `body` is now `[]u8` (mutable) — `fbs.buffered()` already returns
+    // a mutable slice, matching the new signature.
     req.sendBodyComplete(body) catch {
         return FileUploadResult.err("Failed to send upload request");
     };
@@ -418,7 +441,7 @@ pub fn uploadFileToFilesApi(allocator: Allocator, api_key: []const u8, attachmen
     var transfer_buf: [64]u8 = undefined;
     var reader = response.reader(&transfer_buf);
 
-    const response_data = reader.allocRemaining(allocator, std.Io.Limit.limited(MAX_RESPONSE_SIZE)) catch {
+    const response_data = reader.allocRemaining(allocator, Io.Limit.limited(MAX_RESPONSE_SIZE)) catch {
         return FileUploadResult.err("Failed to read upload response");
     };
     defer allocator.free(response_data);
@@ -558,10 +581,13 @@ pub const AnthropicClient = struct {
 
     api_key: []const u8,
     allocator: Allocator,
+    /// Shared `std.Io` used for filesystem access, TCP/TLS, and DNS.
+    /// Owned by `main()` via `std.process.Init` — the client borrows it.
+    io: Io,
 
-    pub fn init(api_key: []const u8, allocator: Allocator) Self {
+    pub fn init(api_key: []const u8, allocator: Allocator, io: Io) Self {
         std.debug.assert(api_key.len > 0);
-        return .{ .api_key = api_key, .allocator = allocator };
+        return .{ .api_key = api_key, .allocator = allocator, .io = io };
     }
 
     /// Blocking HTTP request - call from a background thread.
@@ -582,7 +608,7 @@ pub const AnthropicClient = struct {
     /// For text: includes content inline
     pub fn sendWithFile(self: *Self, request: ChatRequest, file_path: []const u8) ChatResult {
         // Read and prepare the file
-        var attachment = readFileAttachment(self.allocator, file_path) catch |e| {
+        var attachment = readFileAttachment(self.io, self.allocator, file_path) catch |e| {
             return switch (e) {
                 error.UnsupportedFileType => ChatResult.err("Unsupported file type. Only images (jpg, png, gif, webp), text files (txt, md, json, csv), and PDFs are supported."),
                 error.FileTooLarge => ChatResult.err("File too large (max 5MB)"),
@@ -599,7 +625,7 @@ pub const AnthropicClient = struct {
         if (attachment.is_pdf) {
             log.info("Uploading PDF via Files API: {s}", .{getFileName(file_path)});
 
-            var upload_result = uploadFileToFilesApi(self.allocator, self.api_key, attachment);
+            var upload_result = uploadFileToFilesApi(self.io, self.allocator, self.api_key, attachment);
             defer upload_result.deinit(self.allocator);
 
             if (!upload_result.isSuccess()) {
@@ -658,17 +684,19 @@ pub const AnthropicClient = struct {
         canvas_out: []u8,
         text_out: []u8,
     ) !CanvasResult {
-        var client = http.Client{ .allocator = self.allocator };
+        var client = http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
+        // `Io.Writer.fixed` replaces `std.io.fixedBufferStream` (Zig 0.16).
+        // `w.buffered()` yields the written slice (mutable; needed below for
+        // `sendBodyComplete`).
         var body_buf: [64 * 1024]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&body_buf);
-        const w = fbs.writer();
+        var w: Io.Writer = .fixed(&body_buf);
 
         try w.print("{{\"model\":\"{s}\",\"max_tokens\":{d}", .{ request.model, MAX_TOKENS });
         if (request.system) |sys| {
             try w.writeAll(",\"system\":\"");
-            try writeJsonEscapedString(w, sys);
+            try writeJsonEscapedString(&w, sys);
             try w.writeByte('"');
         }
         if (request.tools_json) |tools| {
@@ -682,12 +710,12 @@ pub const AnthropicClient = struct {
             if (!first) try w.writeAll(",");
             first = false;
             try w.print("{{\"role\":\"{s}\",\"content\":\"", .{msg.role.apiName()});
-            if (msg.content) |content| try writeJsonEscapedString(w, content);
+            if (msg.content) |content| try writeJsonEscapedString(&w, content);
             try w.writeAll("\"}");
         }
         try w.writeAll("]}");
 
-        const body = fbs.getWritten();
+        const body = w.buffered();
         std.debug.assert(body.len < body_buf.len);
         if (LOG_PAYLOADS) log.debug("Canvas request: {s}", .{body});
 
@@ -702,7 +730,7 @@ pub const AnthropicClient = struct {
         });
         defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = body.len };
+        // Zig 0.16: `sendBodyComplete` handles transfer_encoding itself.
         try req.sendBodyComplete(body);
 
         var redir_buf: [8 * 1024]u8 = undefined;
@@ -716,7 +744,7 @@ pub const AnthropicClient = struct {
         var reader = resp.reader(&xfer_buf);
         const data = reader.allocRemaining(
             self.allocator,
-            std.Io.Limit.limited(MAX_RESPONSE_SIZE),
+            Io.Limit.limited(MAX_RESPONSE_SIZE),
         ) catch return CanvasResult.err("Failed to read response");
         defer self.allocator.free(data);
 
@@ -806,8 +834,7 @@ pub const AnthropicClient = struct {
     /// Reconstruct a parseCommand-format JSON line from tool name + input.
     /// Returns bytes written, or 0 on buffer overflow.
     fn writeToolUseLine(buf: []u8, name: []const u8, input: std.json.ObjectMap) usize {
-        var fbs = std.io.fixedBufferStream(buf);
-        const tw = fbs.writer();
+        var tw: Io.Writer = .fixed(buf);
 
         tw.writeAll("{\"tool\":\"") catch return 0;
         tw.writeAll(name) catch return 0;
@@ -818,15 +845,18 @@ pub const AnthropicClient = struct {
             tw.writeAll(",\"") catch return 0;
             tw.writeAll(entry.key_ptr.*) catch return 0;
             tw.writeAll("\":") catch return 0;
-            writeJsonVal(tw, entry.value_ptr.*) catch return 0;
+            writeJsonVal(&tw, entry.value_ptr.*) catch return 0;
         }
 
         tw.writeByte('}') catch return 0;
-        return fbs.getWritten().len;
+        return tw.buffered().len;
     }
 
     /// Serialize a std.json.Value to JSON text (for tool_use reconstruction).
-    fn writeJsonVal(tw: anytype, value: std.json.Value) !void {
+    /// Takes a concrete `*Io.Writer` — `writeJsonEscapedString` is typed on the
+    /// same interface, so there is no benefit to `anytype` and plenty of cost
+    /// (monomorphization, worse errors).
+    fn writeJsonVal(tw: *Io.Writer, value: std.json.Value) !void {
         switch (value) {
             .string => |s| {
                 try tw.writeByte('"');
@@ -843,7 +873,7 @@ pub const AnthropicClient = struct {
     }
 
     fn doRequest(self: *Self, request: ChatRequest) !ChatResult {
-        var client = http.Client{ .allocator = self.allocator };
+        var client = http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
         // For large requests with attachments, use dynamic allocation
@@ -876,8 +906,9 @@ pub const AnthropicClient = struct {
             break :blk dynamic_buf.?;
         };
 
-        var fbs = std.io.fixedBufferStream(json_buf);
-        const writer = fbs.writer();
+        // Zig 0.16 writer: `Io.Writer.fixed` replaces fixedBufferStream.
+        var fbs: Io.Writer = .fixed(json_buf);
+        const writer = &fbs;
 
         try writer.print("{{\"model\":\"{s}\",\"max_tokens\":{d}", .{ request.model, MAX_TOKENS });
 
@@ -967,7 +998,7 @@ pub const AnthropicClient = struct {
 
         try writer.writeAll("]}");
 
-        const body = fbs.getWritten();
+        const body = fbs.buffered();
 
         // Assert buffer didn't overflow (would have errored, but belt-and-suspenders)
         std.debug.assert(body.len < json_buf.len);
@@ -1009,8 +1040,9 @@ pub const AnthropicClient = struct {
             });
         defer req.deinit();
 
-        // Send body
-        req.transfer_encoding = .{ .content_length = body.len };
+        // Send body. Zig 0.16: `sendBodyComplete` sets transfer_encoding
+        // internally from the body length — assigning it here would be a
+        // double-write.
         try req.sendBodyComplete(body);
 
         // Receive response
@@ -1026,7 +1058,7 @@ pub const AnthropicClient = struct {
         var transfer_buf: [64]u8 = undefined;
         var reader = response.reader(&transfer_buf);
 
-        const response_data = reader.allocRemaining(self.allocator, std.Io.Limit.limited(MAX_RESPONSE_SIZE)) catch |e| {
+        const response_data = reader.allocRemaining(self.allocator, Io.Limit.limited(MAX_RESPONSE_SIZE)) catch |e| {
             log.err("Failed to read response: {}", .{e});
             return ChatResult.err("Failed to read response");
         };
@@ -1074,7 +1106,11 @@ fn getFileName(path: []const u8) []const u8 {
 
 /// Escapes a string for JSON output per RFC 8259.
 /// Handles all control characters (0x00-0x1F), quotes, and backslashes.
-pub fn writeJsonEscapedString(writer: anytype, str: []const u8) !void {
+///
+/// Takes a concrete `*Io.Writer`. The old `anytype` signature was a holdover
+/// from Zig 0.15 generic streams; 0.16's unified `Io.Writer` interface gives
+/// us a single concrete type and better error messages at call sites.
+pub fn writeJsonEscapedString(writer: *Io.Writer, str: []const u8) !void {
     const hex_digits = "0123456789abcdef";
 
     for (str) |c| {
@@ -1129,26 +1165,39 @@ fn parseAndExtractText(allocator: Allocator, json_data: []const u8) ![]const u8 
 
 test "writeJsonEscapedString escapes control characters" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
 
-    try writeJsonEscapedString(fbs.writer(), "hello\nworld");
-    try std.testing.expectEqualStrings("hello\\nworld", fbs.getWritten());
+    // Zig 0.16: a fresh `Io.Writer.fixed` replaces the old `fbs.reset()` dance.
+    // Each case gets its own writer, which is a cleaner invariant anyway —
+    // the previous buffer contents cannot leak into the next assertion.
+    {
+        var w: Io.Writer = .fixed(&buf);
+        try writeJsonEscapedString(&w, "hello\nworld");
+        try std.testing.expectEqualStrings("hello\\nworld", w.buffered());
+    }
 
-    fbs.reset();
-    try writeJsonEscapedString(fbs.writer(), "tab\there");
-    try std.testing.expectEqualStrings("tab\\there", fbs.getWritten());
+    {
+        var w: Io.Writer = .fixed(&buf);
+        try writeJsonEscapedString(&w, "tab\there");
+        try std.testing.expectEqualStrings("tab\\there", w.buffered());
+    }
 
-    fbs.reset();
-    try writeJsonEscapedString(fbs.writer(), "quote\"here");
-    try std.testing.expectEqualStrings("quote\\\"here", fbs.getWritten());
+    {
+        var w: Io.Writer = .fixed(&buf);
+        try writeJsonEscapedString(&w, "quote\"here");
+        try std.testing.expectEqualStrings("quote\\\"here", w.buffered());
+    }
 
-    fbs.reset();
-    try writeJsonEscapedString(fbs.writer(), "null\x00char");
-    try std.testing.expectEqualStrings("null\\u0000char", fbs.getWritten());
+    {
+        var w: Io.Writer = .fixed(&buf);
+        try writeJsonEscapedString(&w, "null\x00char");
+        try std.testing.expectEqualStrings("null\\u0000char", w.buffered());
+    }
 
-    fbs.reset();
-    try writeJsonEscapedString(fbs.writer(), "bell\x07char");
-    try std.testing.expectEqualStrings("bell\\u0007char", fbs.getWritten());
+    {
+        var w: Io.Writer = .fixed(&buf);
+        try writeJsonEscapedString(&w, "bell\x07char");
+        try std.testing.expectEqualStrings("bell\\u0007char", w.buffered());
+    }
 }
 
 test "parseAndExtractText extracts text content" {

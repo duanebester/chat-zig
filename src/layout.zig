@@ -43,6 +43,14 @@ const CANVAS_PADDING: f32 = 40;
 
 pub fn render(cx: *Cx) void {
     const s = cx.state(AppState);
+
+    // Drain any completed async worker results BEFORE reading other fields.
+    // Workers push WorkerResult values into an Io.Queue on completion; the
+    // render loop is the only consumer. Draining here flips `is_loading`
+    // off and appends the assistant's reply into the message ring before
+    // any child component reads from either — no half-updated frame.
+    s.drainResults(cx);
+
     const size = cx.windowSize();
     const t = theme_mod.get(s.dark_mode);
 

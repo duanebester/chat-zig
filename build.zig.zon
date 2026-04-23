@@ -2,11 +2,11 @@
     .name = .chat_zig,
     .version = "0.1.0",
     .fingerprint = 0xe10436242903a945,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .gooey = .{
-            .url = "git+https://github.com/duanebester/gooey.git#v0.0.14",
-            .hash = "gooey-0.0.14-uPBZ7l0CTwBrxo62F3mizw0j-_JhpNpjZV3FGuwgt3cQ",
+            .url = "https://github.com/duanebester/gooey/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "gooey-0.1.0-uPBZ7o1oUwAaoNl-ELlvIr4HpZ19RF-lPiNswFvTGO4p",
         },
     },
     .paths = .{
