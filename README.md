@@ -118,7 +118,6 @@ pub fn drainResults(self: *AppState, cx: *gooey.Cx) void {
         switch (r) {
             .chat_success => |ok| self.applyChatSuccess(ok),
             .chat_error => |err| self.applyChatError(err),
-            .canvas => |cr| self.applyCanvasResult(cr),
         }
     }
 }

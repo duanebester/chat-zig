@@ -17,7 +17,6 @@ const Easing = gooey.Easing;
 
 const state_mod = @import("state.zig");
 const theme_mod = @import("theme.zig");
-const canvas_state = @import("canvas_state.zig");
 
 const AppState = state_mod.AppState;
 const Message = state_mod.Message;
@@ -34,8 +33,6 @@ const BUBBLE_CORNER_RADIUS = 12;
 const BUTTON_CORNER_RADIUS = 6;
 const CONTENT_PADDING = 24;
 const CHAT_MIN_WIDTH: f32 = 400;
-const CANVAS_MIN_WIDTH: f32 = 360;
-const CANVAS_PADDING: f32 = 40;
 
 // =============================================================================
 // Root Layout
@@ -53,9 +50,6 @@ pub fn render(cx: *Cx) void {
 
     const size = cx.windowSize();
     const t = theme_mod.get(s.dark_mode);
-
-    // Keep canvas theme in sync with app theme.
-    canvas_state.setTheme(s.dark_mode);
 
     if (cx.changed("dark_mode", s.dark_mode) or cx.changed("window_width", size.width)) {
         s.invalidateCachedHeights();
@@ -81,10 +75,6 @@ pub fn render(cx: *Cx) void {
             // Input area card at bottom
             InputArea{},
         }),
-        // Canvas panel (shown when enabled and has content or is loading)
-        ui.when(s.canvas_enabled, .{
-            CanvasPanel{},
-        }),
         // Toolbar — floating in titlebar area (top-right of viewport)
         ui.box(.{
             .floating = .{
@@ -98,112 +88,10 @@ pub fn render(cx: *Cx) void {
             .direction = .row,
             .gap = 4,
         }, .{
-            CanvasToggle{},
             ThemeToggle{},
         }),
     }));
 }
-
-// =============================================================================
-// Canvas Panel (right side panel showing the AI canvas)
-// =============================================================================
-
-const CanvasPanel = struct {
-    pub fn render(_: @This(), cx: *Cx) void {
-        const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
-        const size = cx.windowSize();
-
-        // Canvas panel takes ~45% of window width, clamped to reasonable bounds.
-        const raw_panel_w = size.width * 0.45;
-        const panel_w = @max(CANVAS_MIN_WIDTH, @min(raw_panel_w, canvas_state.CANVAS_WIDTH + CANVAS_PADDING));
-
-        cx.render(ui.box(.{
-            .width = panel_w,
-            .min_width = CANVAS_MIN_WIDTH,
-            .height = size.height,
-            .direction = .column,
-            .padding = .{ .each = .{ .top = 52, .bottom = 20, .left = 0, .right = 20 } },
-            .gap = 8,
-        }, .{
-            // Canvas header
-            ui.box(.{
-                .fill_width = true,
-                .padding = .{ .symmetric = .{ .x = 8, .y = 4 } },
-                .direction = .row,
-                .alignment = .{ .main = .start, .cross = .center },
-                .gap = 8,
-            }, .{
-                Svg{ .path = Lucide.pen_tool, .size = 14, .no_fill = true, .stroke_color = t.accent, .stroke_width = 1.5 },
-                ui.text("Canvas", .{
-                    .size = 13,
-                    .color = t.text_secondary,
-                    .weight = .medium,
-                }),
-                ui.spacer(),
-                ui.textFmt("{d} cmds", .{canvas_state.commandCount()}, .{
-                    .size = 11,
-                    .color = t.text_muted,
-                }),
-            }),
-            // Canvas area with border
-            ui.box(.{
-                .fill_width = true,
-                .grow = true,
-                .background = if (s.dark_mode) Color.rgba(0.08, 0.08, 0.10, 1.0) else Color.rgba(0.96, 0.96, 0.97, 1.0),
-                .border_color = t.border,
-                .border_width = .{ .all = 1 },
-                .corner_radius = 8,
-                .alignment = .{ .main = .center, .cross = .center },
-            }, .{
-                ui.when(canvas_state.hasContent(), .{
-                    ui.canvas(panel_w - CANVAS_PADDING, canvas_state.CANVAS_HEIGHT, canvas_state.paintCanvas),
-                }),
-                ui.when(!canvas_state.hasContent(), .{
-                    ui.box(.{
-                        .direction = .column,
-                        .alignment = .{ .main = .center, .cross = .center },
-                        .gap = 12,
-                    }, .{
-                        Svg{ .path = Lucide.image, .size = 32, .no_fill = true, .stroke_color = t.text_muted, .stroke_width = 1.0 },
-                        ui.text("Ask me to draw something", .{
-                            .size = 14,
-                            .color = t.text_muted,
-                        }),
-                    }),
-                }),
-            }),
-        }));
-    }
-};
-
-// =============================================================================
-// Canvas Toggle Button
-// =============================================================================
-
-const CanvasToggle = struct {
-    pub fn render(_: @This(), cx: *Cx) void {
-        const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
-
-        cx.render(ui.box(.{
-            .width = 36,
-            .height = 36,
-            .corner_radius = 8,
-            .alignment = .{ .main = .center, .cross = .center },
-            .background = if (s.canvas_enabled) t.accent.withAlpha(0.15) else Color.transparent,
-            .on_click_handler = cx.command(AppState.toggleCanvas),
-        }, .{
-            Svg{
-                .path = Lucide.pen_tool,
-                .size = 16,
-                .no_fill = true,
-                .stroke_color = if (s.canvas_enabled) t.accent else t.icon_muted,
-                .stroke_width = 1.0,
-            },
-        }));
-    }
-};
 
 // =============================================================================
 // Theme Toggle

@@ -25,8 +25,6 @@ const gooey = @import("gooey");
 const file_dialog = gooey.file_dialog;
 
 const http = @import("http.zig");
-const canvas_state = @import("canvas_state.zig");
-const canvas_tools = @import("canvas_tools.zig");
 const VirtualListState = gooey.VirtualListState;
 
 // Reach back into `main` for the process-global Io + environ published from
@@ -163,14 +161,13 @@ pub const ErrorResult = struct {
 };
 
 /// Tagged union over every kind of worker outcome so a single `Io.Queue` can
-/// carry either chat or canvas results. The render loop switches on the tag
-/// and applies the matching staging buffer.
+/// carry chat results. The render loop switches on the tag and applies the
+/// matching staging buffer.
 ///
 /// Keep this small: it is copied into the queue's ring buffer by value.
 pub const WorkerResult = union(enum) {
     chat_success: SuccessResult,
     chat_error: ErrorResult,
-    canvas: http.CanvasResult,
 };
 
 // =============================================================================
@@ -202,7 +199,6 @@ pub const AppState = struct {
     error_message: ?[]const u8 = null,
     dark_mode: bool = true, // Start in dark mode like the reference image.
 
-    canvas_enabled: bool = false,
     selected_model: Model = .haiku,
 
     // =========================================================================
@@ -235,11 +231,6 @@ pub const AppState = struct {
 
     pending_file_path: [MAX_FILE_PATH_LEN]u8 = undefined,
     pending_file_path_len: usize = 0,
-
-    pending_canvas_lines: [canvas_state.MAX_CANVAS_BUF]u8 = undefined,
-    pending_canvas_lines_len: usize = 0,
-    pending_canvas_text: [MAX_RESPONSE_LEN]u8 = undefined,
-    pending_canvas_text_len: usize = 0,
 
     // =========================================================================
     // Async Result Plumbing — Zig 0.16 std.Io
@@ -470,21 +461,12 @@ pub const AppState = struct {
         // (CLAUDE rule 20 — "Hot Loop Extraction" applied to the fiber
         // entry point).
         const io = main_mod.process_io;
-        if (self.canvas_enabled) {
-            self.io_group.async(io, canvasWorker, .{
-                io,
-                &self.http_client.?,
-                self,
-                &self.result_queue,
-            });
-        } else {
-            self.io_group.async(io, httpWorker, .{
-                io,
-                &self.http_client.?,
-                self,
-                &self.result_queue,
-            });
-        }
+        self.io_group.async(io, httpWorker, .{
+            io,
+            &self.http_client.?,
+            self,
+            &self.result_queue,
+        });
 
         g.requestRender();
     }
@@ -539,43 +521,6 @@ pub const AppState = struct {
         app.requestRenderFromWorker();
     }
 
-    /// Canvas worker: same shape as `httpWorker`, but with tool-use parsing.
-    /// Writes parsed draw commands + text into the canvas staging buffers.
-    fn canvasWorker(
-        io: std.Io,
-        client: *http.AnthropicClient,
-        app: *Self,
-        queue: *std.Io.Queue(WorkerResult),
-    ) void {
-        var buf: ChatMessagesBuffer = .{};
-        var request = app.buildChatRequest(&buf);
-
-        request.system = canvas_tools.canvas_system_prompt;
-        request.tools_json = canvas_tools.anthropic_tools_json;
-
-        log.info("Sending canvas request with {d} tools", .{canvas_tools.TOOL_COUNT});
-
-        const result = client.sendForCanvas(
-            request,
-            &app.pending_canvas_lines,
-            &app.pending_canvas_text,
-        );
-
-        // On success, publish the lengths alongside the already-written
-        // staging buffers. On error, the staging lengths are irrelevant —
-        // `applyCanvasResult` short-circuits on `has_error`.
-        if (!result.has_error) {
-            app.pending_canvas_lines_len = result.canvas_lines_len;
-            app.pending_canvas_text_len = result.text_len;
-        }
-
-        queue.putOne(io, .{ .canvas = result }) catch |e| {
-            log.debug("canvasWorker: result dropped ({t})", .{e});
-        };
-
-        app.requestRenderFromWorker();
-    }
-
     /// Request a render from a worker fiber. Safe to call from any thread —
     /// `Gooey.requestRender` is threadsafe by contract and only nudges the
     /// event loop; the actual result delivery still flows through the
@@ -604,7 +549,6 @@ pub const AppState = struct {
             switch (r) {
                 .chat_success => |ok| self.applyChatSuccess(ok),
                 .chat_error => |err| self.applyChatError(err),
-                .canvas => |cr| self.applyCanvasResult(cr),
             }
         }
     }
@@ -622,47 +566,14 @@ pub const AppState = struct {
         self.is_loading = false;
     }
 
-    fn applyCanvasResult(self: *Self, result: http.CanvasResult) void {
-        if (result.has_error) {
-            self.error_message = result.error_message;
-            self.is_loading = false;
-            return;
-        }
-
-        // Clear the canvas for a fresh batch, then replay the commands.
-        canvas_state.clearCanvas();
-        if (result.canvas_lines_len > 0) {
-            const lines = self.pending_canvas_lines[0..result.canvas_lines_len];
-            const count = canvas_state.processBatch(lines);
-            log.info("Canvas: applied {d} draw commands", .{count});
-        }
-
-        // Surface any text response from the LLM in the chat history. If the
-        // model replied with only tool calls, drop a short breadcrumb so the
-        // user sees SOMETHING scroll past.
-        if (result.text_len > 0) {
-            const text = self.pending_canvas_text[0..result.text_len];
-            self.addMessage(Message.assistant(text));
-        } else if (result.canvas_lines_len > 0) {
-            self.addMessage(Message.assistant("(drew on canvas)"));
-        }
-
-        self.error_message = null;
-        self.is_loading = false;
-    }
-
     // =========================================================================
-    // Theme / Canvas / Model Toggles
+    // Theme / Model Toggles
     // =========================================================================
 
     pub fn toggleDarkMode(self: *Self, g: *gooey.Gooey) void {
         self.dark_mode = !self.dark_mode;
         g.setAppearance(self.dark_mode);
         g.requestRender();
-    }
-
-    pub fn toggleCanvas(self: *Self, _: *gooey.Gooey) void {
-        self.canvas_enabled = !self.canvas_enabled;
     }
 
     pub fn selectModel(self: *Self, index: usize) void {

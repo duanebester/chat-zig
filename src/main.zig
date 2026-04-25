@@ -59,7 +59,7 @@ fn onEvent(cx: *gooey.Cx, event: gooey.InputEvent) bool {
 }
 
 const App = gooey.App(AppState, &state, layout.render, .{
-    .title = "ChatAI + Canvas",
+    .title = "ChatAI",
     .width = 1100,
     .height = 700,
     // Dark background for glass effect (app starts in dark mode)
