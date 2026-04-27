@@ -446,21 +446,39 @@ const InputArea = struct {
                     ModelSelector{},
                     // Spacer
                     ui.spacer(),
-                    // Send button (circular)
+                    // Send / Stop button (circular). While `is_loading`, the
+                    // same slot becomes a Stop button bound to
+                    // `cancelInFlight` — the streaming text itself is the
+                    // progress indicator, so we reclaim the in-button
+                    // spinner for an actionable affordance.
                     ui.box(.{
                         .width = 36,
                         .height = 36,
                         .corner_radius = BUTTON_CORNER_RADIUS,
-                        .background = if (s.input_slice.len > 0 and s.has_api_key and !s.is_loading) t.primary else t.border,
+                        .background = if (s.is_loading)
+                            t.danger
+                        else if (s.input_slice.len > 0 and s.has_api_key)
+                            t.primary
+                        else
+                            t.border,
                         .alignment = .{ .main = .center, .cross = .center },
-                        .on_click_handler = if (s.has_api_key and !s.is_loading and s.input_slice.len > 0)
+                        .on_click_handler = if (s.is_loading)
+                            cx.command(AppState.cancelInFlight)
+                        else if (s.has_api_key and s.input_slice.len > 0)
                             cx.command(AppState.sendMessage)
                         else
                             null,
                     }, .{
+                        // Stop icon (filled square) — Lucide.square is an
+                        // outlined rect, but the surrounding circular
+                        // button already provides the frame, so the inner
+                        // shape reads as "stop" without extra borders.
+                        // `color` sets the fill; we leave stroke at its
+                        // default (none) so we get a solid block.
                         ui.when(s.is_loading, .{
-                            LoadingSpinner{
-                                .size = 18,
+                            Svg{
+                                .path = Lucide.square,
+                                .size = 12,
                                 .color = if (s.dark_mode) t.card else Color.white,
                             },
                         }),

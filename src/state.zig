@@ -9,15 +9,18 @@
 //!
 //! Zig 0.16 migration notes:
 //!   - Replaced `std.Thread.spawn` + `dispatchOnMainThread` with
-//!     `Io.Group.async` + `Io.Queue(WorkerResult)`. Workers push typed
-//!     results into the queue; the render loop drains them without blocking.
-//!     This eliminates the per-request heap allocations (Task, Context) and
-//!     the two-hop trampoline (bg → dispatch → main) in favour of one
-//!     bounded channel.
+//!     `Io.async` + `Io.Queue(WorkerResult)`. Workers push typed results
+//!     into the queue; the render loop drains them without blocking.
+//!     This eliminates the per-request heap allocations (Task, Context)
+//!     and the two-hop trampoline (bg → dispatch → main) in favour of
+//!     one bounded channel.
 //!   - Filesystem reads, HTTP, TLS, and env lookups all thread through the
 //!     single `std.Io` instance published by `main` (via `std.process.Init`).
-//!   - `io_group` is registered with Gooey so that window close cancels any
-//!     in-flight HTTP work cleanly — no use-after-free on shutdown.
+//!   - The in-flight HTTP worker is tracked as a `std.Io.Future(void)` so
+//!     the user-facing Stop button can cancel exactly one request without
+//!     tearing down anything else. Cancellation propagates through the
+//!     next `Io` call inside the worker (the SSE read or a `putOne`),
+//!     which returns `error.Canceled` and unwinds cleanly.
 
 const std = @import("std");
 const log = std.log.scoped(.chatzig);
@@ -285,17 +288,27 @@ pub const AppState = struct {
     // Async Result Plumbing — Zig 0.16 std.Io
     // =========================================================================
     //
-    // `io_group` tracks every background fiber launched by `sendMessage`. It
-    // is registered with Gooey on init, so window close cancels all in-flight
-    // work before AppState is torn down — no dangling pointers from a worker
-    // into freed state.
+    // `pending_request` is the `Future(void)` for the in-flight HTTP
+    // worker, or `null` when no request is outstanding. We track exactly
+    // one because `is_loading` enforces single-flight: a second
+    // `sendMessage` is a no-op while the first is still running.
     //
-    // `result_queue` carries `WorkerResult` values from worker → render. The
-    // backing storage lives inline on AppState (`RESULT_QUEUE_CAPACITY`
-    // slots); the queue object holds a pointer into it, so AppState must not
-    // be moved after `init` runs.
+    // The Future serves two roles:
+    //   * **Cancel** — `pending_request.?.cancel(io)` from the Stop
+    //     button signals the worker fiber, which receives
+    //     `error.Canceled` from its next IO call (the SSE read or a
+    //     queue `putOne`) and unwinds.
+    //   * **Await** — when the worker terminates normally,
+    //     `pending_request.?.await(io)` releases the task's bookkeeping
+    //     before we drop our reference. Skipping the await would leak
+    //     task memory inside the `Io` implementation.
+    //
+    // `result_queue` carries `WorkerResult` values from worker → render.
+    // The backing storage lives inline on AppState
+    // (`RESULT_QUEUE_CAPACITY` slots); the queue object holds a pointer
+    // into it, so AppState must not be moved after `init` runs.
 
-    io_group: std.Io.Group = .init,
+    pending_request: ?std.Io.Future(void) = null,
     result_buffer: [RESULT_QUEUE_CAPACITY]WorkerResult = undefined,
     result_queue: std.Io.Queue(WorkerResult) = undefined,
 
@@ -325,8 +338,13 @@ pub const AppState = struct {
         // backing buffer already lives at its final address on AppState (we
         // are past the stack→heap move because `init` is called on the
         // mounted, committed state pointer).
+        //
+        // No cancel-group registration: chat-zig is single-flight (one
+        // worker at most) and we track that one worker's `Future`
+        // directly on AppState. On window close the OS reaps the
+        // process; AppState is module-static so there is no teardown
+        // for a stray worker to race against.
         self.result_queue = std.Io.Queue(WorkerResult).init(&self.result_buffer);
-        cx.registerCancelGroup(&self.io_group);
 
         // Look up the API key through the environ published by `main`. On
         // macOS this replaces libc's `getenv`, which `std.posix` no longer
@@ -503,20 +521,92 @@ pub const AppState = struct {
             return;
         }
 
-        // Launch the worker on the shared Io instance. The group owns the
-        // task — cancellation on window close unwinds it cleanly. Worker
-        // functions take only primitives + pointers, never a `self` style
-        // receiver, so the Io runtime can cache arguments in registers
-        // (CLAUDE rule 20 — "Hot Loop Extraction" applied to the fiber
-        // entry point).
+        // Launch the worker on the shared Io instance. `io.async` returns
+        // a `Future(void)` that we stash on `pending_request` so the Stop
+        // button can cancel exactly this one task. Worker functions take
+        // only primitives + pointers, never a `self`-style receiver, so
+        // the Io runtime can cache arguments in registers (CLAUDE rule
+        // #20 — "Hot Loop Extraction" applied to the fiber entry point).
+        //
+        // Single-flight invariant: `is_loading` was just flipped to true
+        // above, so any prior `pending_request` must already have been
+        // awaited and cleared by `drainResults`. Assert that pin before
+        // overwriting the slot — a stale Future here would leak task
+        // memory inside the Io implementation.
+        std.debug.assert(self.pending_request == null);
+
         const io = main_mod.process_io;
-        self.io_group.async(io, httpWorker, .{
+        self.pending_request = io.async(httpWorker, .{
             io,
             &self.http_client.?,
             self,
             &self.result_queue,
         });
 
+        g.requestRender();
+    }
+
+    // =========================================================================
+    // Cancel In-Flight — Stop button
+    // =========================================================================
+
+    /// Cancel the in-flight HTTP worker, if any. Bound to the Stop button
+    /// in the input area; safe to call when no request is outstanding.
+    ///
+    /// Sequencing matters here:
+    ///
+    ///   1. **Drain first** — the worker may be blocked inside `putOne`
+    ///      because the queue is full (we set `RESULT_QUEUE_CAPACITY = 8`,
+    ///      which is generous, but bursty `text_delta` events can hit the
+    ///      cap). Draining unblocks the worker so the cancellation
+    ///      request can land at its next IO call rather than deadlocking.
+    ///
+    ///   2. **Cancel + await** — `Future.cancel(io)` posts the
+    ///      cancellation request and then awaits the worker; it blocks
+    ///      briefly while the worker unwinds. The worker's next IO call
+    ///      (the SSE read or another `putOne`) returns `error.Canceled`,
+    ///      `client.sendStreaming` converts it to a `ChatResult.err`, and
+    ///      the worker pushes a terminal result before returning.
+    ///
+    ///   3. **Drain again** — discard any straggling deltas + the
+    ///      terminal error pushed during step 2. We don't want them
+    ///      surfacing as a red banner on a user-initiated cancel.
+    ///
+    ///   4. **Reset terminal state** — `is_loading = false`,
+    ///      `streaming_message_idx = null`, `error_message = null`. The
+    ///      partial assistant bubble stays in the message history; the
+    ///      user can see what they got before stopping.
+    pub fn cancelInFlight(self: *Self, g: *gooey.Gooey) void {
+        if (self.pending_request == null) return;
+        std.debug.assert(self.is_loading);
+
+        const io = main_mod.process_io;
+
+        // Step 1: drain any backed-up results so the worker can make
+        // forward progress to its next cancelation point. Non-blocking;
+        // discards values rather than applying them — by cancelling, the
+        // user has signalled they don't want to see what's left.
+        var drain_buf: [RESULT_QUEUE_CAPACITY]WorkerResult = undefined;
+        _ = self.result_queue.get(io, &drain_buf, 0) catch {};
+
+        // Step 2: post the cancel and await unwind. `Future.cancel`
+        // returns the worker's `void` return value; we discard it because
+        // any state we care about already flowed through the queue.
+        self.pending_request.?.cancel(io);
+        self.pending_request = null;
+
+        // Step 3: drain the terminal error / final deltas the worker
+        // pushed during cancellation. Same rationale as step 1.
+        _ = self.result_queue.get(io, &drain_buf, 0) catch {};
+
+        // Step 4: explicit terminal state. Done last so a render that
+        // races with the drain still sees `is_loading == true` (and
+        // therefore the Stop button instead of the Send button).
+        self.is_loading = false;
+        self.streaming_message_idx = null;
+        self.error_message = null;
+
+        log.info("Streaming request cancelled by user", .{});
         g.requestRender();
     }
 
@@ -727,8 +817,29 @@ pub const AppState = struct {
         self.list_state.scrollToBottom();
     }
 
+    /// Await and clear the in-flight worker `Future`. Idempotent — safe
+    /// to call when no request is outstanding (e.g., after `cancelInFlight`
+    /// already cleared the slot).
+    ///
+    /// `Future.await(io)` is required for normal completion so the `Io`
+    /// implementation can release the task's bookkeeping. By the time a
+    /// terminal `chat_success` / `chat_error` reaches the render thread,
+    /// the worker has already pushed its last queue item and is on its
+    /// way out — `await` blocks for at most one fiber-scheduling tick.
+    fn awaitPendingRequest(self: *Self) void {
+        if (self.pending_request == null) return;
+        const io = main_mod.process_io;
+        self.pending_request.?.await(io);
+        self.pending_request = null;
+    }
+
     fn applyChatSuccess(self: *Self, r: SuccessResult) void {
         std.debug.assert(r.response_len <= MAX_RESPONSE_LEN);
+
+        // Reap the worker's task slot before we touch any UI state. If
+        // we skipped this we'd leak task memory inside the Io
+        // implementation on every successful request.
+        self.awaitPendingRequest();
 
         // Streaming path: deltas already populated the assistant message.
         // We only need to clear the "stream in flight" tracking.
@@ -749,6 +860,11 @@ pub const AppState = struct {
     }
 
     fn applyChatError(self: *Self, e: ErrorResult) void {
+        // Reap the worker's task slot first — same rationale as
+        // `applyChatSuccess`. The worker has already pushed its terminal
+        // error and is about to return, so the await is brief.
+        self.awaitPendingRequest();
+
         // If the stream already produced visible output, leave the
         // partial assistant message in place — it's better UX than
         // wiping a half-typed paragraph. The error banner still tells
