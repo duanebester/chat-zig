@@ -160,12 +160,38 @@ pub const ErrorResult = struct {
     message: []const u8,
 };
 
+/// Incremental delta delivered while a streaming request is in flight.
+///
+/// The worker fiber appends bytes to `pending_response_buf` and bumps
+/// `pending_response_len`, then publishes the new high-water mark via this
+/// result. The render thread copies `pending_response_buf[0..cumulative_len]`
+/// into the streaming assistant message.
+///
+/// Why a high-water mark instead of just the new chunk? Two reasons:
+///   1. Idempotent — if the queue ever delivered the same delta twice (it
+///      shouldn't, but invariants are cheaper than debugging), applying the
+///      same `cumulative_len` twice is a no-op rather than a duplicate
+///      paste.
+///   2. Self-synchronizing — the render thread always knows the exact slice
+///      to read, with no need to track a separate "applied so far" counter.
+pub const DeltaResult = struct {
+    /// New total length of `pending_response_buf` after this delta. Always
+    /// strictly greater than the previous delta's `cumulative_len` (the
+    /// worker only appends, never rewinds), and always `<= MAX_RESPONSE_LEN`.
+    cumulative_len: u32,
+};
+
 /// Tagged union over every kind of worker outcome so a single `Io.Queue` can
 /// carry chat results. The render loop switches on the tag and applies the
 /// matching staging buffer.
 ///
 /// Keep this small: it is copied into the queue's ring buffer by value.
+///
+/// Streaming flow: `chat_delta` may fire many times before exactly one of
+/// `chat_success` / `chat_error` terminates the stream. Non-streaming
+/// flow: `chat_delta` never fires.
 pub const WorkerResult = union(enum) {
+    chat_delta: DeltaResult,
     chat_success: SuccessResult,
     chat_error: ErrorResult,
 };
@@ -225,12 +251,35 @@ pub const AppState = struct {
     //
     // This is the same discipline as the pre-0.16 "TigersEye" pattern, but
     // without the dispatcher trampoline — the queue IS the synchronization.
+    //
+    // Streaming refinement: `pending_response_buf` is *append-only* during
+    // a streaming request. The worker writes bytes at offsets
+    // `[old_len, new_len)` and publishes `new_len` via a `chat_delta`. The
+    // render thread only ever reads `[0, last_delivered_len)`. Because
+    // those ranges are disjoint and each `putOne` is a happens-before edge
+    // for the bytes it announces, no atomics or mutex are required.
 
     pending_response_buf: [MAX_RESPONSE_LEN]u8 = undefined,
     pending_response_len: usize = 0,
 
     pending_file_path: [MAX_FILE_PATH_LEN]u8 = undefined,
     pending_file_path_len: usize = 0,
+
+    /// Ring-buffer index of the placeholder assistant `Message` we are
+    /// currently streaming into, or `null` if no stream is in flight.
+    ///
+    /// Set by `applyChatDelta` on the first delta (which appends an empty
+    /// `Message.assistant("")`), cleared by `applyChatSuccess` /
+    /// `applyChatError` when the stream terminates. The index is into the
+    /// public `getMessage(i)` space (0..message_count) — the same one the
+    /// virtual list iterates — *not* the underlying `messages[]` slot.
+    ///
+    /// Invariants:
+    ///   * If `streaming_message_idx == null`, `is_loading` may still be
+    ///     true (request sent, no deltas yet).
+    ///   * If `streaming_message_idx == i`, `getMessage(i).?.role` is
+    ///     `.assistant` and `is_loading` is true.
+    streaming_message_idx: ?u32 = null,
 
     // =========================================================================
     // Async Result Plumbing — Zig 0.16 std.Io
@@ -475,49 +524,125 @@ pub const AppState = struct {
     // Workers — run on an Io fiber, off the main thread
     // =========================================================================
 
-    /// Chat worker: builds the request, blocks on the HTTP call, writes the
-    /// response text into `pending_response_buf`, and signals completion via
-    /// the result queue. Never touches UI state directly.
+    /// Bundle the worker fiber needs to forward each SSE delta to the
+    /// render thread. Lives on the worker's stack — the sink callback only
+    /// runs while `httpWorker` is on the stack, so the pointers are valid
+    /// for the entire stream's lifetime by construction.
+    const StreamCtx = struct {
+        io: std.Io,
+        app: *AppState,
+        queue: *std.Io.Queue(WorkerResult),
+    };
+
+    /// SSE sink callback — runs on the worker fiber for each `text_delta`
+    /// chunk. Appends to the staging buffer and pushes a `chat_delta`
+    /// result. Returning `error.Aborted` short-circuits the SSE read loop;
+    /// we do that once the staging buffer is full so the worker doesn't
+    /// keep parsing bytes it has nowhere to put.
+    fn onStreamDelta(userdata: *anyopaque, text: []const u8) http.StreamSink.Error!void {
+        const ctx: *StreamCtx = @ptrCast(@alignCast(userdata));
+        const app = ctx.app;
+
+        // Append-only into the staging buffer. CLAUDE rule #4: bounded.
+        const old_len = app.pending_response_len;
+        std.debug.assert(old_len <= MAX_RESPONSE_LEN);
+        const remaining = MAX_RESPONSE_LEN - old_len;
+
+        // No room left — tell the SSE loop to stop reading. The
+        // accumulated message stays as-is; the user sees a (truncated)
+        // response, the stream tears down cleanly.
+        if (remaining == 0) return error.Aborted;
+
+        const to_copy = @min(text.len, remaining);
+        @memcpy(
+            app.pending_response_buf[old_len .. old_len + to_copy],
+            text[0..to_copy],
+        );
+        const new_len = old_len + to_copy;
+        app.pending_response_len = new_len;
+
+        // Publish the new high-water mark. `putOne` is the happens-before
+        // edge: the bytes we just wrote at `[old_len, new_len)` are visible
+        // to the render thread only after it drains this result.
+        //
+        // The queue is bounded (RESULT_QUEUE_CAPACITY = 8) so `putOne`
+        // blocks the worker if the render thread falls behind — natural
+        // backpressure that keeps the staging buffer in sync with what the
+        // UI has actually displayed.
+        const cumulative_len: u32 = @intCast(new_len);
+        ctx.queue.putOne(ctx.io, .{ .chat_delta = .{ .cumulative_len = cumulative_len } }) catch |e| {
+            // Queue closed (window closing) — abort the stream so the
+            // worker unwinds quickly. Truncation is the right behavior:
+            // by the time the queue is closed, AppState is being torn
+            // down anyway.
+            log.debug("onStreamDelta: queue closed ({t}), aborting", .{e});
+            return error.Aborted;
+        };
+
+        // Nudge the run loop. `requestRender` is threadsafe by contract.
+        app.requestRenderFromWorker();
+    }
+
+    /// Chat worker: builds the request, opens an SSE stream against
+    /// Anthropic's Messages API, forwards each `text_delta` to the render
+    /// thread via `onStreamDelta`, and finally signals stream completion
+    /// (success or error). Never touches UI state directly.
+    ///
+    /// Streaming is unconditional — the API supports it on every model
+    /// and the UX is strictly better. The non-streaming `sendBlocking`
+    /// path on `AnthropicClient` remains available for tests / future
+    /// callers, but this worker does not exercise it.
     fn httpWorker(
         io: std.Io,
         client: *http.AnthropicClient,
         app: *Self,
         queue: *std.Io.Queue(WorkerResult),
     ) void {
+        // Reset the staging buffer for this request. Worker is single-flight
+        // (guarded by `is_loading`), so no other fiber can be reading or
+        // writing here. We reset *before* touching the queue so a stale
+        // `pending_response_len` from a previous request can never leak
+        // into the first delta.
+        app.pending_response_len = 0;
+
         var buf: ChatMessagesBuffer = .{};
         const request = app.buildChatRequest(&buf);
+
+        var ctx = StreamCtx{ .io = io, .app = app, .queue = queue };
+        const sink = http.StreamSink{
+            .userdata = @ptrCast(&ctx),
+            .callback = onStreamDelta,
+        };
 
         var result: http.ChatResult = undefined;
         if (app.pending_file_path_len > 0) {
             const file_path = app.pending_file_path[0..app.pending_file_path_len];
-            log.info("Sending message with file attachment: {s}", .{file_path});
-            result = client.sendWithFile(request, file_path);
+            log.info("Streaming message with file attachment: {s}", .{file_path});
+            result = client.sendStreamingWithFile(request, file_path, sink);
         } else {
-            result = client.sendBlocking(request);
+            result = client.sendStreaming(request, sink);
         }
         defer result.deinit(client.allocator);
 
-        // Copy text into the staging buffer BEFORE pushing to the queue.
-        // `putOne` is the happens-before edge — the main thread observes
-        // these writes only after it drains the matching result.
+        // Terminal result. Note that on success, `result.text` is the full
+        // accumulated response — but the staging buffer already holds it
+        // (built up via deltas), so we don't re-copy. We just signal
+        // "stream done, the bytes you've already drained are final".
+        //
+        // On error, the staging buffer may hold a partial response. We
+        // leave it in place so the assistant message keeps whatever it
+        // managed to render — same UX as a network drop mid-paragraph.
         const outcome: WorkerResult = switch (result.status) {
-            .success => |text| blk: {
-                const len = @min(text.len, MAX_RESPONSE_LEN);
-                @memcpy(app.pending_response_buf[0..len], text[0..len]);
-                app.pending_response_len = len;
-                break :blk .{ .chat_success = .{ .response_len = len } };
-            },
-            .err => |msg| WorkerResult{ .chat_error = .{ .message = msg } },
+            .success => .{ .chat_success = .{ .response_len = app.pending_response_len } },
+            .err => |msg| .{ .chat_error = .{ .message = msg } },
         };
 
         queue.putOne(io, outcome) catch |e| {
-            // Queue closed (teardown) or task cancelled (group cancelled):
-            // the main thread is already tearing down, so drop the result.
-            log.debug("httpWorker: result dropped ({t})", .{e});
+            // Queue closed (teardown) or task cancelled: main thread is
+            // tearing down, drop the result.
+            log.debug("httpWorker: terminal result dropped ({t})", .{e});
         };
 
-        // Poke the main thread so it runs a render and drains the queue.
-        // Without this, the frame may not fire until the next input event.
         app.requestRenderFromWorker();
     }
 
@@ -547,14 +672,76 @@ pub const AppState = struct {
         std.debug.assert(drained.len <= RESULT_QUEUE_CAPACITY);
         for (drained) |r| {
             switch (r) {
+                .chat_delta => |d| self.applyChatDelta(d),
                 .chat_success => |ok| self.applyChatSuccess(ok),
                 .chat_error => |err| self.applyChatError(err),
             }
         }
     }
 
+    /// Apply one streaming delta. Lazily creates an empty assistant
+    /// `Message` on the first delta of a stream, then grows it in-place
+    /// for every subsequent delta. The cached layout height is
+    /// invalidated each time so the virtual list re-measures the
+    /// growing bubble on the next frame.
+    fn applyChatDelta(self: *Self, d: DeltaResult) void {
+        std.debug.assert(d.cumulative_len <= MAX_RESPONSE_LEN);
+        std.debug.assert(self.is_loading);
+
+        // First delta: append the placeholder assistant message and
+        // remember its index. `addMessage` does the virtual-list /
+        // scroll bookkeeping; we just have to capture the index *after*
+        // the message is appended (so it survives any future overwrites
+        // — which can't happen during a single stream, but the
+        // assertion below pins the invariant either way).
+        if (self.streaming_message_idx == null) {
+            self.addMessage(Message.assistant(""));
+            std.debug.assert(self.message_count > 0);
+            self.streaming_message_idx = @intCast(self.message_count - 1);
+        }
+
+        const idx = self.streaming_message_idx.?;
+        std.debug.assert(idx < self.message_count);
+
+        // Compute the slot in the underlying ring and grow the message in
+        // place. Worker only appends, so `cumulative_len` only goes up;
+        // an out-of-order delta would trip the assertion below.
+        const ring_idx = (self.message_head + idx) % MAX_MESSAGES;
+        std.debug.assert(self.messages[ring_idx].role == .assistant);
+
+        const new_len: usize = @intCast(d.cumulative_len);
+        const cap = @min(new_len, MAX_MESSAGE_LEN);
+        std.debug.assert(cap >= self.messages[ring_idx].content_len);
+
+        @memcpy(
+            self.messages[ring_idx].content[0..cap],
+            self.pending_response_buf[0..cap],
+        );
+        self.messages[ring_idx].content_len = cap;
+        // Invalidate cached height — the bubble just grew. The virtual
+        // list will re-measure on the next render pass.
+        self.messages[ring_idx].cached_height = 0.0;
+
+        // Keep the freshly-grown message visible. `scrollToBottom` is
+        // idempotent and cheap.
+        self.list_state.scrollToBottom();
+    }
+
     fn applyChatSuccess(self: *Self, r: SuccessResult) void {
         std.debug.assert(r.response_len <= MAX_RESPONSE_LEN);
+
+        // Streaming path: deltas already populated the assistant message.
+        // We only need to clear the "stream in flight" tracking.
+        if (self.streaming_message_idx != null) {
+            self.streaming_message_idx = null;
+            self.error_message = null;
+            self.is_loading = false;
+            return;
+        }
+
+        // Fallback: stream completed without producing any deltas (zero-
+        // length response). Surface as a single empty assistant message
+        // for visual consistency rather than silently dropping the turn.
         const response = self.pending_response_buf[0..r.response_len];
         self.addMessage(Message.assistant(response));
         self.error_message = null;
@@ -562,6 +749,11 @@ pub const AppState = struct {
     }
 
     fn applyChatError(self: *Self, e: ErrorResult) void {
+        // If the stream already produced visible output, leave the
+        // partial assistant message in place — it's better UX than
+        // wiping a half-typed paragraph. The error banner still tells
+        // the user something went wrong.
+        self.streaming_message_idx = null;
         self.error_message = e.message;
         self.is_loading = false;
     }

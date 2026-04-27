@@ -38,6 +38,20 @@ pub const MAX_MESSAGES: usize = 256;
 pub const MAX_FILE_SIZE: usize = 5 * 1024 * 1024; // 5MB max file size
 pub const MAX_FILE_ID_LEN: usize = 128; // Max length for file IDs from Files API
 
+/// Per-line buffer for the SSE reader. Anthropic `text_delta` events are
+/// typically a few hundred bytes; 16 KiB gives generous headroom for any
+/// single `data:` line (including the JSON envelope) without being
+/// wasteful. Lines longer than this are dropped via `tossBuffered` —
+/// the `gooey/src/examples/ai_canvas.zig` line reader uses the same
+/// pattern. CLAUDE rule #4 (put a limit on everything) applies here.
+pub const SSE_READER_BUF_SIZE: usize = 16 * 1024;
+
+/// Maximum length of any single `text_delta` chunk we will copy out of
+/// the parsed JSON. Bounded so a hostile / buggy server cannot cause an
+/// unbounded `dupe()`. Picked to comfortably exceed the 16 KiB reader
+/// buffer so it never trips on legitimate traffic.
+pub const MAX_DELTA_TEXT_LEN: usize = 32 * 1024;
+
 // =============================================================================
 // Request Types (Framework-agnostic)
 // =============================================================================
@@ -99,6 +113,26 @@ pub const ChatRequest = struct {
     messages: []const ChatMessage,
     /// Optional file attachment (will be added to the last user message)
     attachment: ?FileAttachment = null,
+};
+
+/// Callback invoked from the HTTP fiber for each `text_delta` chunk parsed
+/// from an SSE stream. Returning `error.Aborted` from the callback short-
+/// circuits the read loop — useful when the consumer's staging buffer is
+/// full and there is no point reading further.
+///
+/// The `text` slice is borrowed from the SSE reader's internal buffer and
+/// is only valid for the duration of the call. Callbacks must copy the
+/// bytes they want to keep (typically into a staging buffer behind a
+/// happens-before edge such as `Io.Queue.putOne`).
+///
+/// `userdata` is the opaque pointer the caller passed alongside `callback`
+/// — the SSE loop never inspects it. Callbacks that don't need state can
+/// pass `undefined` and ignore the parameter.
+pub const StreamSink = struct {
+    pub const Error = error{Aborted};
+
+    userdata: *anyopaque,
+    callback: *const fn (userdata: *anyopaque, text: []const u8) Error!void,
 };
 
 // =============================================================================
@@ -566,8 +600,30 @@ pub const AnthropicClient = struct {
         std.debug.assert(request.messages.len > 0);
         std.debug.assert(request.messages.len <= MAX_MESSAGES);
 
-        return self.doRequest(request) catch |e| {
+        return self.doRequest(request, null) catch |e| {
             log.err("HTTP request failed: {}", .{e});
+            return ChatResult.err("Request failed");
+        };
+    }
+
+    /// Streaming HTTP request — emits `"stream": true` in the request body
+    /// and parses the response as Server-Sent Events. Each `text_delta`
+    /// chunk is delivered to `sink` as it arrives. The returned
+    /// `ChatResult` carries the *final accumulated text* on success (so
+    /// callers that don't care about incremental delivery still get the
+    /// full response), or an error message on failure.
+    ///
+    /// Threading: same contract as `sendBlocking` — call from a worker
+    /// fiber. The sink is invoked synchronously from this fiber, so the
+    /// callback must be brief and must not call back into UI state
+    /// directly. Pattern: copy the bytes into a staging buffer, then push
+    /// a `WorkerResult.chat_delta` onto the result queue.
+    pub fn sendStreaming(self: *Self, request: ChatRequest, sink: StreamSink) ChatResult {
+        std.debug.assert(request.messages.len > 0);
+        std.debug.assert(request.messages.len <= MAX_MESSAGES);
+
+        return self.doRequest(request, sink) catch |e| {
+            log.err("HTTP streaming request failed: {}", .{e});
             return ChatResult.err("Request failed");
         };
     }
@@ -618,13 +674,70 @@ pub const AnthropicClient = struct {
         var req_with_file = request;
         req_with_file.attachment = attachment;
 
-        return self.doRequest(req_with_file) catch |e| {
+        return self.doRequest(req_with_file, null) catch |e| {
             log.err("HTTP request failed: {}", .{e});
             return ChatResult.err("Request failed");
         };
     }
 
-    fn doRequest(self: *Self, request: ChatRequest) !ChatResult {
+    /// Streaming variant of `sendWithFile`. See `sendStreaming` for the
+    /// sink contract; file handling is identical to the non-streaming
+    /// path (PDFs go through the Files API first, images are base64'd
+    /// inline, text is embedded).
+    pub fn sendStreamingWithFile(
+        self: *Self,
+        request: ChatRequest,
+        file_path: []const u8,
+        sink: StreamSink,
+    ) ChatResult {
+        // Read and prepare the file. This mirrors `sendWithFile` exactly —
+        // duplicated rather than factored out because the error→ChatResult
+        // mapping is the only meaningful body and inlining it keeps the
+        // control flow legible at the call site.
+        var attachment = readFileAttachment(self.io, self.allocator, file_path) catch |e| {
+            return switch (e) {
+                error.UnsupportedFileType => ChatResult.err("Unsupported file type. Only images (jpg, png, gif, webp), text files (txt, md, json, csv), and PDFs are supported."),
+                error.FileTooLarge => ChatResult.err("File too large (max 5MB)"),
+                error.InvalidUtf8 => ChatResult.err("Text file contains invalid UTF-8 characters"),
+                else => ChatResult.err("Failed to read attachment"),
+            };
+        };
+        defer self.allocator.free(attachment.content);
+
+        var file_id_buf: ?[]u8 = null;
+        defer if (file_id_buf) |id| self.allocator.free(id);
+
+        if (attachment.is_pdf) {
+            log.info("Uploading PDF via Files API: {s}", .{getFileName(file_path)});
+
+            var upload_result = uploadFileToFilesApi(self.io, self.allocator, self.api_key, attachment);
+            defer upload_result.deinit(self.allocator);
+
+            if (!upload_result.isSuccess()) {
+                return switch (upload_result.status) {
+                    .err => |msg| ChatResult.err(msg),
+                    .success => unreachable,
+                };
+            }
+
+            const file_id = upload_result.getFileId() orelse return ChatResult.err("No file ID returned");
+            file_id_buf = self.allocator.alloc(u8, file_id.len) catch return ChatResult.err("Failed to allocate file ID");
+            @memcpy(file_id_buf.?, file_id);
+
+            attachment.file_id = file_id_buf;
+            log.info("PDF uploaded successfully, file_id: {s}", .{file_id_buf.?});
+        }
+
+        var req_with_file = request;
+        req_with_file.attachment = attachment;
+
+        return self.doRequest(req_with_file, sink) catch |e| {
+            log.err("HTTP streaming request failed: {}", .{e});
+            return ChatResult.err("Request failed");
+        };
+    }
+
+    fn doRequest(self: *Self, request: ChatRequest, sink: ?StreamSink) !ChatResult {
         var client = http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
 
@@ -663,6 +776,11 @@ pub const AnthropicClient = struct {
         const writer = &fbs;
 
         try writer.print("{{\"model\":\"{s}\",\"max_tokens\":{d}", .{ request.model, MAX_TOKENS });
+
+        // Streaming flag: when a sink is provided, ask the server for SSE.
+        // Emitting this before `messages` keeps the JSON shape stable for
+        // anyone scanning the prefix in logs.
+        if (sink != null) try writer.writeAll(",\"stream\":true");
 
         try writer.writeAll(",\"messages\":[");
 
@@ -793,7 +911,26 @@ pub const AnthropicClient = struct {
             return ChatResult.err("API returned error");
         }
 
-        // Read response body
+        // Streaming branch: drive the SSE loop, accumulate text into an
+        // owned buffer for the final ChatResult, and forward each chunk
+        // to the sink as it arrives. The reader buffer must hold one full
+        // SSE line (`data: ` + JSON envelope) — 16 KiB is generous for
+        // text_delta events (typical chunk size is < 1 KiB) without being
+        // wasteful.
+        if (sink) |s| {
+            var sse_buf: [SSE_READER_BUF_SIZE]u8 = undefined;
+            // `Response.reader` already returns a `*Io.Reader` — taking
+            // its address would yield a `**Io.Reader` and confuse the
+            // type checker. Pass the pointer through verbatim.
+            const reader = response.reader(&sse_buf);
+
+            return self.readSseStream(reader, s) catch |e| {
+                log.err("SSE stream failed: {}", .{e});
+                return ChatResult.err("Streaming response failed");
+            };
+        }
+
+        // Non-streaming branch (unchanged): read the whole body, then parse.
         var transfer_buf: [64]u8 = undefined;
         var reader = response.reader(&transfer_buf);
 
@@ -816,7 +953,190 @@ pub const AnthropicClient = struct {
 
         return ChatResult.success(text);
     }
+
+    /// Drive the SSE read loop. Reads one line at a time via
+    /// `Io.Reader.takeDelimiter`, parses `data:` lines as Anthropic stream
+    /// events, and forwards `text_delta` text to `sink` while also
+    /// accumulating it into an owned buffer for the final ChatResult.
+    ///
+    /// Bounded by SSE_READER_BUF_SIZE per line and MAX_RESPONSE_SIZE total
+    /// (CLAUDE rule #4 — put a limit on everything). Lines longer than
+    /// the reader buffer are dropped via `tossBuffered`, mirroring the
+    /// `gooey/src/examples/ai_canvas.zig` line reader.
+    fn readSseStream(self: *Self, reader: *Io.Reader, sink: StreamSink) !ChatResult {
+        // Accumulator for the final response text. Grows dynamically up to
+        // MAX_RESPONSE_SIZE — past that, further deltas are dropped from
+        // the accumulator (and from the sink) so we fail closed rather than
+        // OOM. The aggregated text is what `ChatResult.success` carries.
+        var accum: std.Io.Writer.Allocating = .init(self.allocator);
+        defer accum.deinit();
+
+        // We key off each `data:` payload's `type` field rather than the
+        // sibling `event:` line — Anthropic emits both, and the JSON
+        // payload is authoritative.
+        var aborted = false;
+
+        while (true) {
+            const line_or_null = reader.takeDelimiter('\n') catch |err| switch (err) {
+                error.StreamTooLong => {
+                    // Oversized line — drop the whole line and resync to the
+                    // next newline. Real Anthropic events never exceed the
+                    // reader buffer; this is defensive against future
+                    // protocol changes.
+                    log.warn("SSE line exceeded {d} bytes, dropping", .{SSE_READER_BUF_SIZE});
+                    drainSseLine(reader);
+                    continue;
+                },
+                error.ReadFailed => return ChatResult.err("Streaming read failed"),
+            };
+
+            const line = line_or_null orelse break; // EOF
+            const trimmed = trimCr(line);
+
+            // Blank line ends an SSE event — we already process each
+            // `data:` line eagerly, so blank lines are no-ops.
+            if (trimmed.len == 0) continue;
+
+            // Comment / event-name lines — ignore. Only `data:` carries
+            // the JSON payload we care about.
+            if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+
+            // Strip the prefix and any single leading space (per RFC 6455
+            // for SSE: most servers emit `data: ` with one space).
+            var payload = trimmed["data:".len..];
+            if (payload.len > 0 and payload[0] == ' ') payload = payload[1..];
+            if (payload.len == 0) continue;
+
+            const text = parseSseTextDelta(self.allocator, payload) catch |e| {
+                // Parse errors are non-fatal — Anthropic may add new event
+                // shapes, and `ping` events have no `delta` field. Log at
+                // debug so a real protocol break is still discoverable.
+                log.debug("SSE event ignored ({t}): {s}", .{ e, payload });
+                continue;
+            };
+            const owned_text = text orelse continue; // not a text_delta
+            defer self.allocator.free(owned_text);
+
+            // Forward to sink first — if it aborts, stop reading the
+            // stream but still return whatever we've accumulated so the
+            // caller can present a partial response.
+            if (!aborted) {
+                sink.callback(sink.userdata, owned_text) catch |e| switch (e) {
+                    error.Aborted => aborted = true,
+                };
+            }
+
+            // Append to the accumulator, capped at MAX_RESPONSE_SIZE. Past
+            // the cap we silently drop further deltas — the sink may have
+            // its own (smaller) cap, and the accumulator's job is just to
+            // produce the final ChatResult.
+            const remaining = MAX_RESPONSE_SIZE - @min(accum.written().len, MAX_RESPONSE_SIZE);
+            if (remaining > 0) {
+                const to_write = @min(owned_text.len, remaining);
+                accum.writer.writeAll(owned_text[0..to_write]) catch
+                    return ChatResult.err("Out of memory accumulating stream");
+            }
+        }
+
+        const final_text = accum.toOwnedSlice() catch
+            return ChatResult.err("Out of memory finalizing stream");
+
+        if (final_text.len == 0) {
+            self.allocator.free(final_text);
+            return ChatResult.err("Empty streaming response");
+        }
+
+        if (LOG_PAYLOADS) {
+            log.debug("SSE final ({d} bytes): {s}", .{ final_text.len, final_text });
+        }
+
+        return ChatResult.success(final_text);
+    }
 };
+
+// =============================================================================
+// SSE Helpers
+// =============================================================================
+
+/// SSE event payload shape we care about. Anthropic emits a wide variety of
+/// event types (`message_start`, `content_block_start`, `ping`, etc.); the
+/// only ones with text we want to stream are `content_block_delta` events
+/// whose `delta.type == "text_delta"`. `ignore_unknown_fields` lets the
+/// parser skip every other field (including the entire `message` object on
+/// `message_start`) without us spelling them out.
+const SseDelta = struct {
+    type: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+};
+
+const SseEvent = struct {
+    type: []const u8,
+    delta: ?SseDelta = null,
+};
+
+/// Parse one `data:` payload from the Anthropic SSE stream. Returns an
+/// owned copy of the delta text on `text_delta` events, or `null` for any
+/// other event type (`ping`, `message_start`, `content_block_stop`, …).
+/// The owned slice is bounded by `MAX_DELTA_TEXT_LEN`; longer chunks are
+/// truncated rather than rejected so a single oversize event cannot stall
+/// the stream.
+///
+/// Errors propagate from the JSON parser only — malformed payloads are
+/// surfaced so the caller can log them at debug. The caller should treat
+/// any error as "skip this event and keep reading", matching how the
+/// Anthropic docs describe handling unknown event types.
+pub fn parseSseTextDelta(allocator: Allocator, payload: []const u8) !?[]const u8 {
+    std.debug.assert(payload.len > 0);
+
+    const parsed = try std.json.parseFromSlice(SseEvent, allocator, payload, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    // Only `content_block_delta` events carry incremental text. Everything
+    // else (ping, message_start, content_block_stop, message_stop, error)
+    // is meaningful at the protocol level but not here.
+    if (!std.mem.eql(u8, parsed.value.type, "content_block_delta")) return null;
+
+    const delta = parsed.value.delta orelse return null;
+    const delta_type = delta.type orelse return null;
+    if (!std.mem.eql(u8, delta_type, "text_delta")) return null;
+
+    const text = delta.text orelse return null;
+    if (text.len == 0) return null;
+
+    // Truncate before duplicating so the bounded copy is paid for once.
+    const len = @min(text.len, MAX_DELTA_TEXT_LEN);
+    return try allocator.dupe(u8, text[0..len]);
+}
+
+/// After `error.StreamTooLong`, the reader buffer is full with no newline
+/// found. Drain buffered bytes and keep reading until the next newline (or
+/// EOF / read error). Mirrors the helper in
+/// `gooey/src/examples/ai_canvas.zig` so the failure mode is identical.
+fn drainSseLine(reader: *Io.Reader) void {
+    reader.tossBuffered();
+    while (true) {
+        _ = reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => {
+                reader.tossBuffered();
+                continue;
+            },
+            error.ReadFailed => return,
+        };
+        return;
+    }
+}
+
+/// Trim a trailing '\r' if present. SSE on the wire is technically
+/// `\r\n`-delimited per the W3C spec, so even though we split on `\n`
+/// alone we still need to strip the carriage return.
+fn trimCr(line: []const u8) []const u8 {
+    if (line.len > 0 and line[line.len - 1] == '\r') {
+        return line[0 .. line.len - 1];
+    }
+    return line;
+}
 
 // =============================================================================
 // JSON Helpers
@@ -1088,4 +1408,123 @@ test "getFileName extracts filename from path" {
     try std.testing.expectEqualStrings("file.txt", getFileName("/path/to/file.txt"));
     try std.testing.expectEqualStrings("image.png", getFileName("image.png"));
     try std.testing.expectEqualStrings("doc.pdf", getFileName("/a/b/c/doc.pdf"));
+}
+
+// =============================================================================
+// SSE Tests
+// =============================================================================
+//
+// These cover the pure SSE helpers — `parseSseTextDelta` and `trimCr`. The
+// `readSseStream` loop itself isn't exercised here because it requires a
+// live `Io.Reader`; the helpers carry the parsing contract so unit tests
+// against the wire format are sufficient. Sample payloads come from the
+// Anthropic streaming docs (see docs.claude.com → Streaming Messages).
+
+test "parseSseTextDelta extracts text from content_block_delta" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+    ;
+
+    const text = (try parseSseTextDelta(allocator, payload)) orelse return error.TestExpectedNonNull;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("Hello", text);
+}
+
+test "parseSseTextDelta returns null for non-text_delta events" {
+    const allocator = std.testing.allocator;
+
+    // ping — no delta at all.
+    const ping = "{\"type\": \"ping\"}";
+    try std.testing.expect((try parseSseTextDelta(allocator, ping)) == null);
+
+    // message_start — has a `message` field but no `delta.text`.
+    const message_start =
+        \\{"type":"message_start","message":{"id":"msg_x","role":"assistant","content":[]}}
+    ;
+    try std.testing.expect((try parseSseTextDelta(allocator, message_start)) == null);
+
+    // content_block_stop — content_block_delta sibling but no text payload.
+    const stop =
+        \\{"type":"content_block_stop","index":0}
+    ;
+    try std.testing.expect((try parseSseTextDelta(allocator, stop)) == null);
+}
+
+test "parseSseTextDelta ignores input_json_delta (tool use) events" {
+    // We deliberately surface only `text_delta`. Tool-use partial JSON
+    // would corrupt the assistant message bubble if it leaked through.
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\":"}}
+    ;
+    try std.testing.expect((try parseSseTextDelta(allocator, payload)) == null);
+}
+
+test "parseSseTextDelta ignores thinking_delta events" {
+    // Extended-thinking content streams via a separate delta type. We
+    // ignore it for the chat surface — exposing private reasoning would
+    // be the wrong UX.
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step 1"}}
+    ;
+    try std.testing.expect((try parseSseTextDelta(allocator, payload)) == null);
+}
+
+test "parseSseTextDelta handles JSON-escaped text" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"line1\nline2\t\"quoted\""}}
+    ;
+
+    const text = (try parseSseTextDelta(allocator, payload)) orelse return error.TestExpectedNonNull;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("line1\nline2\t\"quoted\"", text);
+}
+
+test "parseSseTextDelta returns null for empty text" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}
+    ;
+    try std.testing.expect((try parseSseTextDelta(allocator, payload)) == null);
+}
+
+test "parseSseTextDelta truncates oversized text to MAX_DELTA_TEXT_LEN" {
+    // A pathological server could emit a `text_delta` larger than our
+    // bound. Truncation is the right behavior — fail closed with a
+    // visible-but-bounded chunk rather than allowing an unbounded
+    // dupe(). Build the input dynamically so the test source stays
+    // readable even when MAX_DELTA_TEXT_LEN moves.
+    const allocator = std.testing.allocator;
+    const oversize_len = MAX_DELTA_TEXT_LEN + 1024;
+
+    const payload_buf = try allocator.alloc(u8, oversize_len + 128);
+    defer allocator.free(payload_buf);
+
+    var w: Io.Writer = .fixed(payload_buf);
+    try w.writeAll("{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"");
+    var i: usize = 0;
+    while (i < oversize_len) : (i += 1) try w.writeByte('a');
+    try w.writeAll("\"}}");
+
+    const text = (try parseSseTextDelta(allocator, w.buffered())) orelse return error.TestExpectedNonNull;
+    defer allocator.free(text);
+    try std.testing.expectEqual(@as(usize, MAX_DELTA_TEXT_LEN), text.len);
+}
+
+test "parseSseTextDelta surfaces parse errors for malformed JSON" {
+    const allocator = std.testing.allocator;
+    const payload = "not json at all";
+    try std.testing.expectError(error.SyntaxError, parseSseTextDelta(allocator, payload));
+}
+
+test "trimCr strips trailing carriage return" {
+    try std.testing.expectEqualStrings("hello", trimCr("hello\r"));
+    try std.testing.expectEqualStrings("hello", trimCr("hello"));
+    try std.testing.expectEqualStrings("", trimCr(""));
+    try std.testing.expectEqualStrings("", trimCr("\r"));
+    // Only the last \r is stripped — embedded \r should pass through.
+    try std.testing.expectEqualStrings("a\rb", trimCr("a\rb"));
 }
