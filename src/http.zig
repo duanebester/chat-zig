@@ -52,6 +52,31 @@ pub const SSE_READER_BUF_SIZE: usize = 16 * 1024;
 /// buffer so it never trips on legitimate traffic.
 pub const MAX_DELTA_TEXT_LEN: usize = 32 * 1024;
 
+/// Maximum HTTP-request attempts before surfacing a terminal error.
+/// Anthropic's docs explicitly call out 429 (rate_limit_error) and 529
+/// (overloaded_error) as retry-worthy, with exponential backoff
+/// recommended; 4xx other than 408/429 are deterministic and never
+/// improve on retry. Capped low (3) so worst-case wall-clock to surface
+/// a final error stays inside ~3.5s — same budget as
+/// `gooey/src/image/loader.zig`. Tunable policy belongs higher in the
+/// stack, not here.
+pub const MAX_FETCH_ATTEMPTS: u32 = 3;
+
+/// Base backoff before the second attempt. Doubled on each subsequent
+/// attempt: 500ms, 1s, 2s. `u64` matches the shift operand below.
+pub const BASE_BACKOFF_MS: u64 = 500;
+
+/// ±JITTER_PERCENT of the base backoff is added on each retry. Prevents
+/// thundering-herd retry storms when many clients fail simultaneously
+/// (Anthropic 529 overload typically clears in waves, not one client at
+/// a time).
+pub const JITTER_PERCENT: u64 = 25;
+
+/// Maximum `Retry-After` value we honor, in seconds. Caps a misbehaving
+/// (or hostile) server from pinning us indefinitely. 60s is well above
+/// any plausible Anthropic queueing delay.
+pub const MAX_RETRY_AFTER_SECS: u64 = 60;
+
 // =============================================================================
 // Request Types (Framework-agnostic)
 // =============================================================================
@@ -319,6 +344,236 @@ pub fn base64Encode(allocator: Allocator, data: []const u8) ![]const u8 {
 }
 
 // =============================================================================
+// Retry / Backoff
+// =============================================================================
+//
+// HTTP fetch with bounded exponential backoff, jitter, and `Retry-After`
+// header support. Mirrors `gooey/src/image/loader.zig`, with two
+// chat-specific differences:
+//
+//   1. Generic over the result type T — both the chat completion
+//      (`ChatResult`) and the Files-API upload (`FileUploadResult`)
+//      flow through the same retry loop.
+//   2. Honors `Retry-After` (RFC 7231 § 7.1.3, seconds form). Anthropic
+//      may include this header on 429 / 503 / 529; ignoring it would be
+//      bad citizenship and may further deprioritize our requests.
+//
+// Retry boundary: pre-stream only. Once `receiveHead` returns 200 and
+// we hand off to the SSE loop, any failure is terminal — replaying the
+// user turn after partial output would create a confusing UX (text
+// appears, vanishes, reappears differently).
+//
+// Cancellation: `io.sleep` propagates `error.Canceled` so the Stop
+// button stays responsive even during a long backoff. The worker
+// unwinds cleanly without an extra wakeup mechanism.
+
+/// Classification of HTTP / network failure — drives retry decisions.
+/// Split from the underlying Zig error sets so the loop has a single,
+/// tiny enum to switch on rather than re-classifying dozens of errors.
+pub const FetchError = error{
+    /// Transient: safe to retry. HTTP 408/429/5xx, connect/TLS failure,
+    /// truncated read, write-during-send. The same request, replayed,
+    /// has a real chance of succeeding.
+    Transient,
+    /// Permanent: retrying cannot help. HTTP 4xx (other than 408/429),
+    /// malformed URL, OOM, unsupported scheme, decode error.
+    Permanent,
+};
+
+/// Outcome of one attempt of an HTTP request.
+///
+/// `terminal` means "stop retrying and return this T" — covers both
+/// success and definitive failure (e.g., 200 stream consumed, 400 Bad
+/// Request, 401 invalid key). `transient` means "wait and retry", with
+/// an optional `Retry-After` seconds override extracted from the
+/// response header.
+fn AttemptOutcome(comptime T: type) type {
+    return union(enum) {
+        terminal: T,
+        transient: ?u64,
+    };
+}
+
+/// Classify an HTTP status code. Anthropic-specific codes are folded
+/// in: 429 (rate_limit_error) and 529 (overloaded_error). 408 (request
+/// timeout) is also retried — almost always a transient client/server
+/// desync. 4xx other than 408/429 are permanent (bad request, auth,
+/// payload-too-large, etc.); 5xx other than 529 is transient.
+fn classifyHttpStatus(status: http.Status) FetchError {
+    // 529 is inside 500..599 — list it in the comment, not the match,
+    // so the switch has no duplicate values.
+    return switch (@intFromEnum(status)) {
+        408, 429 => error.Transient,
+        // 5xx (including Anthropic's 529 overloaded_error) — server is
+        // recovering, retrying typically helps.
+        500...599 => error.Transient,
+        else => error.Permanent,
+    };
+}
+
+/// Classify errors returned by `http.Client.request()`. OOM and
+/// programmer-error variants (unsupported URI scheme) are permanent;
+/// connect/DNS/TLS failures are transient.
+fn classifyRequestError(err: anyerror) FetchError {
+    return switch (err) {
+        error.OutOfMemory,
+        error.UnsupportedUriScheme,
+        error.UriMissingHost,
+        error.CertificateBundleLoadFailure,
+        => error.Permanent,
+        // ConnectionRefused, TemporaryNameServerFailure, NetworkUnreachable,
+        // TlsInitializationFailed, etc. — transient by nature.
+        else => error.Transient,
+    };
+}
+
+/// Classify errors returned by `Request.receiveHead()`. Malformed HTTP
+/// and redirect-shape errors are deterministic protocol breakage — the
+/// server won't suddenly start speaking HTTP correctly on retry.
+fn classifyReceiveHeadError(err: anyerror) FetchError {
+    return switch (err) {
+        error.HttpHeadersInvalid,
+        error.TooManyHttpRedirects,
+        error.RedirectRequiresResend,
+        error.HttpRedirectLocationMissing,
+        error.HttpRedirectLocationOversize,
+        error.HttpRedirectLocationInvalid,
+        error.HttpContentEncodingUnsupported,
+        error.HttpChunkInvalid,
+        error.HttpChunkTruncated,
+        error.HttpHeadersOversize,
+        error.UnsupportedUriScheme,
+        error.OutOfMemory,
+        error.CertificateBundleLoadFailure,
+        => error.Permanent,
+        // ReadFailed, WriteFailed, connection drops — transient.
+        else => error.Transient,
+    };
+}
+
+/// Parse an RFC 7231 § 7.1.3 `Retry-After` header value. Only the
+/// integer-seconds form is supported; the HTTP-date form returns null
+/// and callers fall back to the exponential backoff. Anthropic emits
+/// seconds, so this is sufficient in practice.
+fn parseRetryAfterSeconds(value: []const u8) ?u64 {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(u64, trimmed, 10) catch null;
+}
+
+/// Extract the first `Retry-After` header from a response head. Header
+/// names are case-insensitive per RFC 7230; Anthropic emits lowercase
+/// `retry-after` but we don't rely on that. Returns null if missing or
+/// unparseable. Must be called BEFORE `response.reader()` since that
+/// invalidates the head's slices.
+fn parseRetryAfterFromHead(head: http.Client.Response.Head) ?u64 {
+    var it = head.iterateHeaders();
+    while (it.next()) |hdr| {
+        if (eqlIgnoreCase(hdr.name, "retry-after")) {
+            return parseRetryAfterSeconds(hdr.value);
+        }
+    }
+    return null;
+}
+
+/// Compute the backoff sleep, in milliseconds. Pure function — split
+/// out so the retry loop stays focused on control flow. The
+/// `Retry-After` override is treated as a floor: we use
+/// `max(retry_after, exp_jittered)` so the header lengthens our wait
+/// when the server explicitly asked for it, but we never shorten the
+/// jittered backoff.
+fn computeBackoffMs(attempt: u32, retry_after_s: ?u64, rng: std.Random) i64 {
+    std.debug.assert(attempt < 63);
+    const base_ms: u64 = BASE_BACKOFF_MS << @as(u6, @intCast(attempt));
+
+    // Symmetric jitter in [-JITTER_PERCENT%, +JITTER_PERCENT%].
+    const jitter_range_ms: u64 = base_ms * JITTER_PERCENT / 100;
+    const jitter_signed: i64 = rng.intRangeAtMost(
+        i64,
+        -@as(i64, @intCast(jitter_range_ms)),
+        @as(i64, @intCast(jitter_range_ms)),
+    );
+    const exp_ms: i64 = @as(i64, @intCast(base_ms)) + jitter_signed;
+    // base_ms ≥ 500, jitter ≤ ±125 on attempt 0 — plenty above zero.
+    // Assert so a future tweak to constants trips here instead of
+    // panicking inside Duration.
+    std.debug.assert(exp_ms > 0);
+
+    if (retry_after_s) |secs| {
+        const capped: u64 = @min(secs, MAX_RETRY_AFTER_SECS);
+        const retry_ms: i64 = @as(i64, @intCast(capped)) * 1000;
+        return @max(retry_ms, exp_ms);
+    }
+    return exp_ms;
+}
+
+/// Bounded exponential backoff with jitter and `Retry-After` override.
+///
+/// `ctx` must expose an `attempt(self) Io.Cancelable!AttemptOutcome(T)`
+/// method. The helper drives the retry loop, sleeping between attempts
+/// via `io.sleep(.., .awake)` (monotonic clock — backoff timing must
+/// not jump when the wall clock is adjusted by NTP or a sysadmin).
+/// On exhaustion all attempts return `give_up`.
+///
+/// Cancellation: `error.Canceled` propagates from either the attempt
+/// itself (via `try`) or the backoff sleep, unwinding cleanly to the
+/// worker. The Stop button stays responsive throughout.
+fn fetchWithRetry(
+    comptime T: type,
+    io: Io,
+    rng: std.Random,
+    ctx: anytype,
+    give_up: T,
+) Io.Cancelable!T {
+    comptime std.debug.assert(MAX_FETCH_ATTEMPTS > 0);
+
+    var attempt: u32 = 0;
+    while (attempt < MAX_FETCH_ATTEMPTS) : (attempt += 1) {
+        switch (try ctx.attempt()) {
+            .terminal => |v| return v,
+            .transient => |retry_after_s| {
+                // Last attempt — sleeping just to give up wastes time.
+                if (attempt + 1 >= MAX_FETCH_ATTEMPTS) {
+                    log.info(
+                        "Anthropic request: transient failure on final attempt {d}/{d}, giving up",
+                        .{ attempt + 1, MAX_FETCH_ATTEMPTS },
+                    );
+                    return give_up;
+                }
+
+                const sleep_ms = computeBackoffMs(attempt, retry_after_s, rng);
+                log.info(
+                    "Anthropic request: transient failure on attempt {d}/{d}, backing off {d}ms{s}",
+                    .{
+                        attempt + 1,
+                        MAX_FETCH_ATTEMPTS,
+                        sleep_ms,
+                        if (retry_after_s != null) " (Retry-After honored)" else "",
+                    },
+                );
+
+                try io.sleep(Io.Duration.fromMilliseconds(sleep_ms), .awake);
+            },
+        }
+    }
+    // Loop exits only via explicit return — the final iteration either
+    // returned a terminal value or returned `give_up`.
+    unreachable;
+}
+
+/// Seed a PRNG from the monotonic clock for backoff jitter. Chat
+/// requests don't have a stable identity (unlike image URLs in
+/// `gooey/src/image/loader.zig`), so we use a fresh timestamp seed
+/// per call. Determinism per-call is not a requirement — independence
+/// across concurrent retries is.
+fn seedBackoffPrng(io: Io) std.Random.DefaultPrng {
+    const ts = Io.Clock.Timestamp.now(io, .awake);
+    const nanos: i96 = ts.raw.toNanoseconds();
+    const seed: u64 = @bitCast(@as(i64, @truncate(nanos)));
+    return std.Random.DefaultPrng.init(seed);
+}
+
+// =============================================================================
 // Files API (for PDF uploads)
 // =============================================================================
 
@@ -363,8 +618,13 @@ pub const FileUploadResult = struct {
     }
 };
 
-/// Upload a file to the Anthropic Files API (required for PDFs)
-/// Returns a FileUploadResult containing the file_id on success
+/// Upload a file to the Anthropic Files API (required for PDFs).
+/// Returns a FileUploadResult containing the file_id on success.
+///
+/// Retries the upload itself with bounded exponential backoff on
+/// transient HTTP / network failures, mirroring the chat-request retry
+/// policy. The multipart body is built once (not per attempt) — files
+/// can be megabytes and re-encoding per retry would defeat the purpose.
 pub fn uploadFileToFilesApi(
     io: Io,
     allocator: Allocator,
@@ -374,20 +634,17 @@ pub fn uploadFileToFilesApi(
     std.debug.assert(api_key.len > 0);
     std.debug.assert(attachment.content.len > 0);
 
-    // Zig 0.16: http.Client now carries an Io instance for DNS, TCP, and TLS.
-    var client = http.Client{ .allocator = allocator, .io = io };
-    defer client.deinit();
-
-    // Build multipart form data
+    // Build multipart body once. None of this depends on the attempt
+    // number, and the file content can be megabytes — re-encoding per
+    // retry would waste both CPU and memory.
     const boundary = "----AnthropicFileBoundary";
     const file_name = getFileName(attachment.path);
 
-    // Calculate size needed for multipart body
     // Format: --boundary\r\nContent-Disposition: form-data; name="file"; filename="..."\r\nContent-Type: ...\r\n\r\n<content>\r\n--boundary--\r\n
     const header_template = "--{s}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n";
     const footer = "\r\n--" ++ boundary ++ "--\r\n";
 
-    // Estimate header size (generous)
+    // Estimate header size (generous).
     const header_size_estimate = 256 + file_name.len + attachment.media_type.len;
     const total_size = header_size_estimate + attachment.content.len + footer.len;
 
@@ -399,95 +656,141 @@ pub fn uploadFileToFilesApi(
     // Zig 0.16 replaced `std.io.fixedBufferStream` with `Io.Writer.fixed`.
     // The Writer exposes `buffered()` to retrieve the filled slice.
     var fbs: Io.Writer = .fixed(body_buf);
-
-    // Write multipart header
     fbs.print(header_template, .{ boundary, file_name, attachment.media_type }) catch {
         return FileUploadResult.err("Failed to write multipart header");
     };
-
-    // Write file content
     fbs.writeAll(attachment.content) catch {
         return FileUploadResult.err("Failed to write file content");
     };
-
-    // Write footer
     fbs.writeAll(footer) catch {
         return FileUploadResult.err("Failed to write multipart footer");
     };
-
     const body = fbs.buffered();
+
     if (LOG_PAYLOADS) {
         log.debug("Files API upload: {d} bytes for {s}", .{ body.len, file_name });
     }
 
-    // Build content-type header with boundary
+    // Build content-type header with boundary.
     var content_type_buf: [128]u8 = undefined;
     const content_type = std.fmt.bufPrint(&content_type_buf, "multipart/form-data; boundary={s}", .{boundary}) catch {
         return FileUploadResult.err("Failed to format content type");
     };
 
-    // Parse URI
     const uri = Uri.parse(FILES_API_URL) catch {
         return FileUploadResult.err("Failed to parse Files API URL");
     };
 
-    // Make request
-    var req = client.request(.POST, uri, .{
-        .headers = .{
-            .accept_encoding = .{ .override = "identity" },
-        },
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = content_type },
-            .{ .name = "x-api-key", .value = api_key },
-            .{ .name = "anthropic-version", .value = "2023-06-01" },
-            .{ .name = "anthropic-beta", .value = "files-api-2025-04-14" },
-        },
-    }) catch {
-        return FileUploadResult.err("Failed to create upload request");
-    };
-    defer req.deinit();
-
-    // Send body. In Zig 0.16, `sendBodyComplete` sets `transfer_encoding`
-    // internally from `body.len`; the explicit assignment is no longer needed.
-    // Note: `body` is now `[]u8` (mutable) — `fbs.buffered()` already returns
-    // a mutable slice, matching the new signature.
-    req.sendBodyComplete(body) catch {
-        return FileUploadResult.err("Failed to send upload request");
+    // Drive the retry loop. Cancellation propagates from `io.sleep`
+    // inside `fetchWithRetry`, surfaced here as `error.Canceled` —
+    // mapped to a benign error so the caller's existing `deinit` path
+    // works unchanged.
+    var prng = seedBackoffPrng(io);
+    const ctx = UploadAttemptCtx{
+        .io = io,
+        .allocator = allocator,
+        .api_key = api_key,
+        .uri = uri,
+        .body = body,
+        .content_type = content_type,
     };
 
-    // Receive response
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch {
-        return FileUploadResult.err("Failed to receive upload response");
-    };
-
-    if (response.head.status != .ok) {
-        log.err("Files API error: {}", .{response.head.status});
-        return FileUploadResult.err("Files API returned error");
-    }
-
-    // Read response body
-    var transfer_buf: [64]u8 = undefined;
-    var reader = response.reader(&transfer_buf);
-
-    const response_data = reader.allocRemaining(allocator, Io.Limit.limited(MAX_RESPONSE_SIZE)) catch {
-        return FileUploadResult.err("Failed to read upload response");
-    };
-    defer allocator.free(response_data);
-
-    if (LOG_PAYLOADS) {
-        log.debug("Files API response: {s}", .{response_data});
-    }
-
-    // Parse response to extract file_id
-    // Response format: {"id":"file-xxx","type":"file",...}
-    const file_id = parseFileId(allocator, response_data) catch {
-        log.err("Failed to parse file_id from response: {s}", .{response_data});
-        return FileUploadResult.err("Failed to parse upload response");
-    };
-
-    return FileUploadResult.success(file_id);
+    return fetchWithRetry(
+        FileUploadResult,
+        io,
+        prng.random(),
+        ctx,
+        FileUploadResult.err("File upload failed after retries"),
+    ) catch FileUploadResult.err("File upload cancelled");
 }
+
+/// Per-upload state captured for retry. Body, URI, and headers don't
+/// depend on attempt number; the connection state does, so `attempt()`
+/// creates a fresh `http.Client` on each call.
+const UploadAttemptCtx = struct {
+    io: Io,
+    allocator: Allocator,
+    api_key: []const u8,
+    uri: Uri,
+    body: []u8,
+    content_type: []const u8,
+
+    fn attempt(c: @This()) Io.Cancelable!AttemptOutcome(FileUploadResult) {
+        var client = http.Client{ .allocator = c.allocator, .io = c.io };
+        defer client.deinit();
+
+        var req = client.request(.POST, c.uri, .{
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = c.content_type },
+                .{ .name = "x-api-key", .value = c.api_key },
+                .{ .name = "anthropic-version", .value = "2023-06-01" },
+                .{ .name = "anthropic-beta", .value = "files-api-2025-04-14" },
+            },
+        }) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            return switch (classifyRequestError(err)) {
+                error.Transient => .{ .transient = null },
+                error.Permanent => .{ .terminal = FileUploadResult.err("Failed to create upload request") },
+            };
+        };
+        defer req.deinit();
+
+        req.sendBodyComplete(c.body) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            // Send-side failures are always transient — retry is the
+            // right response. Body slice is reusable across attempts.
+            return .{ .transient = null };
+        };
+
+        var redirect_buf: [8 * 1024]u8 = undefined;
+        var response = req.receiveHead(&redirect_buf) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            return switch (classifyReceiveHeadError(err)) {
+                error.Transient => .{ .transient = null },
+                error.Permanent => .{ .terminal = FileUploadResult.err("Failed to receive upload response") },
+            };
+        };
+
+        if (response.head.status != .ok) {
+            const status_code: u32 = @intFromEnum(response.head.status);
+            log.err("Files API HTTP {d}", .{status_code});
+            switch (classifyHttpStatus(response.head.status)) {
+                error.Transient => {
+                    // Read Retry-After before `response.reader()` so the
+                    // head's slices are still valid.
+                    const retry_after_s = parseRetryAfterFromHead(response.head);
+                    if (retry_after_s) |s| log.info("Files API Retry-After: {d}s", .{s});
+                    return .{ .transient = retry_after_s };
+                },
+                error.Permanent => {
+                    return .{ .terminal = FileUploadResult.err("Files API returned error") };
+                },
+            }
+        }
+
+        // 200 — past the retry boundary. Read body + parse file_id.
+        var transfer_buf: [64]u8 = undefined;
+        var reader = response.reader(&transfer_buf);
+        const response_data = reader.allocRemaining(c.allocator, Io.Limit.limited(MAX_RESPONSE_SIZE)) catch {
+            return .{ .terminal = FileUploadResult.err("Failed to read upload response") };
+        };
+        defer c.allocator.free(response_data);
+
+        if (LOG_PAYLOADS) {
+            log.debug("Files API response: {s}", .{response_data});
+        }
+
+        // Parse response to extract file_id.
+        // Response format: {"id":"file-xxx","type":"file",...}
+        const file_id = parseFileId(c.allocator, response_data) catch {
+            log.err("Failed to parse file_id from response: {s}", .{response_data});
+            return .{ .terminal = FileUploadResult.err("Failed to parse upload response") };
+        };
+
+        return .{ .terminal = FileUploadResult.success(file_id) };
+    }
+};
 
 /// Parse file_id from Files API response JSON
 fn parseFileId(allocator: Allocator, response: []const u8) ![]const u8 {
@@ -738,9 +1041,6 @@ pub const AnthropicClient = struct {
     }
 
     fn doRequest(self: *Self, request: ChatRequest, sink: ?StreamSink) !ChatResult {
-        var client = http.Client{ .allocator = self.allocator, .io = self.io };
-        defer client.deinit();
-
         // For large requests with attachments, use dynamic allocation
         var dynamic_buf: ?[]u8 = null;
         defer if (dynamic_buf) |buf| self.allocator.free(buf);
@@ -857,83 +1157,200 @@ pub const AnthropicClient = struct {
 
         const body = fbs.buffered();
 
-        // Assert buffer didn't overflow (would have errored, but belt-and-suspenders)
+        // Assert buffer didn't overflow (would have errored, but belt-and-suspenders).
         std.debug.assert(body.len < json_buf.len);
         if (LOG_PAYLOADS) {
             log.debug("Request body: {s}", .{body});
         }
 
-        // Parse URI
         const uri = try Uri.parse(API_URL);
 
-        // Check if we need the files beta header (for PDF attachments)
+        // The files-api beta header is conditional on PDF attachments —
+        // sending it unconditionally would also work, but stripping it
+        // when not needed keeps log noise down on the Anthropic side.
         const needs_files_beta = if (request.attachment) |att| att.is_pdf and att.file_id != null else false;
 
-        // Make request
-        var req = if (needs_files_beta)
-            try client.request(.POST, uri, .{
-                .headers = .{
-                    // Disable compression - server sends gzip by default which we don't decode
-                    .accept_encoding = .{ .override = "identity" },
-                },
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json" },
-                    .{ .name = "x-api-key", .value = self.api_key },
-                    .{ .name = "anthropic-version", .value = "2023-06-01" },
-                    .{ .name = "anthropic-beta", .value = "files-api-2025-04-14" },
-                },
-            })
+        // Pre-stream retry only: each attempt rebuilds the connection
+        // (fresh client) and runs through `attemptOnce`. Once a 200 is
+        // observed and we hand off to the SSE loop, all further failures
+        // are terminal — replaying after partial output would create a
+        // confusing UX where text appears, vanishes, reappears different.
+        // Body and URI are computed once above; the retry budget runs
+        // over only the network roundtrip and head parse.
+        var prng = seedBackoffPrng(self.io);
+        const ctx = ChatAttemptCtx{
+            .self = self,
+            .body = body,
+            .uri = uri,
+            .needs_files_beta = needs_files_beta,
+            .sink = sink,
+        };
+
+        return fetchWithRetry(
+            ChatResult,
+            self.io,
+            prng.random(),
+            ctx,
+            ChatResult.err("Request failed after retries"),
+        );
+    }
+
+    /// Per-request state captured for retry. Body, URI, and headers
+    /// don't depend on attempt number; the connection state does, so
+    /// `attempt()` creates a fresh `http.Client` on each call.
+    const ChatAttemptCtx = struct {
+        self: *Self,
+        body: []u8,
+        uri: Uri,
+        needs_files_beta: bool,
+        sink: ?StreamSink,
+
+        fn attempt(c: @This()) Io.Cancelable!AttemptOutcome(ChatResult) {
+            return c.self.attemptOnce(c.body, c.uri, c.needs_files_beta, c.sink);
+        }
+    };
+
+    /// Run one request → receive-head → body-or-stream attempt. Errors
+    /// before the SSE handoff are classified for retry; after the
+    /// handoff (200 reached, sink invoked at least once) all failures
+    /// are terminal. Cancellation propagates as `error.Canceled` —
+    /// `fetchWithRetry` catches it via `try ctx.attempt()` and unwinds.
+    fn attemptOnce(
+        self: *Self,
+        body: []u8,
+        uri: Uri,
+        needs_files_beta: bool,
+        sink: ?StreamSink,
+    ) Io.Cancelable!AttemptOutcome(ChatResult) {
+        var client = http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+
+        // Headers MUST be built on this stack frame, not in a helper —
+        // `RequestOptions.extra_headers` is documented as "Externally-
+        // owned; must outlive the Request". A previous version of this
+        // code factored the construction into `buildPostRequest`, which
+        // returned the Request while the `&.{...}` array literal lived
+        // on the helper's frame — by the time `sendHead` walked the
+        // header slice it was reading freed stack memory (segfault at
+        // 0xa0 in `prepareCiphertextRecord` during TLS write).
+        //
+        // The slice's lifetime now matches `req`'s: both die at the
+        // end of this function, after `defer req.deinit()` runs.
+        const standard_headers: http.Client.Request.Headers = .{
+            // Disable compression — server sends gzip by default which we don't decode.
+            .accept_encoding = .{ .override = "identity" },
+        };
+        const extra_headers_full = [_]http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "x-api-key", .value = self.api_key },
+            .{ .name = "anthropic-version", .value = "2023-06-01" },
+            .{ .name = "anthropic-beta", .value = "files-api-2025-04-14" },
+        };
+        const extra_headers_basic = [_]http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "x-api-key", .value = self.api_key },
+            .{ .name = "anthropic-version", .value = "2023-06-01" },
+        };
+        // Slice off either the 4-header or 3-header form. Both array
+        // literals live on this frame, so the slice we hand to
+        // `client.request` outlives `req` regardless of branch.
+        const extra_headers: []const http.Header = if (needs_files_beta)
+            &extra_headers_full
         else
-            try client.request(.POST, uri, .{
-                .headers = .{
-                    // Disable compression - server sends gzip by default which we don't decode
-                    .accept_encoding = .{ .override = "identity" },
-                },
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json" },
-                    .{ .name = "x-api-key", .value = self.api_key },
-                    .{ .name = "anthropic-version", .value = "2023-06-01" },
-                },
-            });
+            &extra_headers_basic;
+
+        var req = client.request(.POST, uri, .{
+            .headers = standard_headers,
+            .extra_headers = extra_headers,
+        }) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            return switch (classifyRequestError(err)) {
+                error.Transient => .{ .transient = null },
+                error.Permanent => .{ .terminal = ChatResult.err("Failed to build request") },
+            };
+        };
         defer req.deinit();
 
         // Send body. Zig 0.16: `sendBodyComplete` sets transfer_encoding
-        // internally from the body length — assigning it here would be a
-        // double-write.
-        try req.sendBodyComplete(body);
+        // internally from the body length. Send-side errors are always
+        // transient — connection drop, peer close, write timeout —
+        // retry is exactly the right response. The body slice is
+        // reusable across attempts.
+        req.sendBodyComplete(body) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            return .{ .transient = null };
+        };
 
-        // Receive response
         var redirect_buf: [8 * 1024]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            return switch (classifyReceiveHeadError(err)) {
+                error.Transient => .{ .transient = null },
+                error.Permanent => .{ .terminal = ChatResult.err("HTTP receive failed") },
+            };
+        };
 
         if (response.head.status != .ok) {
-            log.err("API error: {}", .{response.head.status});
-            return ChatResult.err("API returned error");
+            const status_code: u32 = @intFromEnum(response.head.status);
+            log.err("Anthropic API HTTP {d}", .{status_code});
+
+            switch (classifyHttpStatus(response.head.status)) {
+                error.Transient => {
+                    // Read Retry-After BEFORE `response.reader()` so the
+                    // head's slices are still valid (reader invalidates).
+                    const retry_after_s = parseRetryAfterFromHead(response.head);
+                    if (retry_after_s) |s| log.info("Anthropic Retry-After: {d}s", .{s});
+                    return .{ .transient = retry_after_s };
+                },
+                error.Permanent => {
+                    // Coarse mapping — richer parsing of the Anthropic
+                    // `error.type` JSON envelope (rate_limit_error,
+                    // invalid_request_error, etc.) is a follow-up.
+                    const msg: []const u8 = switch (status_code) {
+                        400 => "Bad request",
+                        401 => "Invalid API key",
+                        402 => "Payment required",
+                        403 => "Forbidden",
+                        404 => "Not found",
+                        413 => "Request too large",
+                        422 => "Unprocessable entity",
+                        else => "API returned error",
+                    };
+                    return .{ .terminal = ChatResult.err(msg) };
+                },
+            }
         }
 
-        // Streaming branch: drive the SSE loop, accumulate text into an
-        // owned buffer for the final ChatResult, and forward each chunk
-        // to the sink as it arrives. The reader buffer must hold one full
-        // SSE line (`data: ` + JSON envelope) — 16 KiB is generous for
-        // text_delta events (typical chunk size is < 1 KiB) without being
-        // wasteful.
+        // 200 — past the retry boundary. From here on, all failures
+        // are terminal (no replay after partial stream output).
+        return .{ .terminal = self.consumeOkResponse(&response, sink) };
+    }
+
+    /// Drain a 200 OK response: SSE stream when `sink` is set, otherwise
+    /// blocking read + JSON parse. All failures here are terminal — see
+    /// `attemptOnce` for the retry-boundary rationale. The reader
+    /// buffer holds one full SSE line (`data: ` + JSON envelope); 16 KiB
+    /// is generous for text_delta events (typical chunk < 1 KiB).
+    fn consumeOkResponse(
+        self: *Self,
+        response: *http.Client.Response,
+        sink: ?StreamSink,
+    ) ChatResult {
         if (sink) |s| {
             var sse_buf: [SSE_READER_BUF_SIZE]u8 = undefined;
             // `Response.reader` already returns a `*Io.Reader` — taking
             // its address would yield a `**Io.Reader` and confuse the
             // type checker. Pass the pointer through verbatim.
             const reader = response.reader(&sse_buf);
-
-            return self.readSseStream(reader, s) catch |e| {
+            return self.readSseStream(reader, s) catch |e| blk: {
                 log.err("SSE stream failed: {}", .{e});
-                return ChatResult.err("Streaming response failed");
+                break :blk ChatResult.err("Streaming response failed");
             };
         }
 
-        // Non-streaming branch (unchanged): read the whole body, then parse.
+        // Non-streaming branch: read the whole body, then parse.
         var transfer_buf: [64]u8 = undefined;
         var reader = response.reader(&transfer_buf);
-
         const response_data = reader.allocRemaining(self.allocator, Io.Limit.limited(MAX_RESPONSE_SIZE)) catch |e| {
             log.err("Failed to read response: {}", .{e});
             return ChatResult.err("Failed to read response");
@@ -945,12 +1362,10 @@ pub const AnthropicClient = struct {
             log.debug("Response ({d} bytes): {s}", .{ response_data.len, response_data });
         }
 
-        // Parse response and extract text
         const text = parseAndExtractText(self.allocator, response_data) catch |e| {
             log.err("Failed to parse response: {}", .{e});
             return ChatResult.err("Failed to parse response");
         };
-
         return ChatResult.success(text);
     }
 
@@ -1527,4 +1942,67 @@ test "trimCr strips trailing carriage return" {
     try std.testing.expectEqualStrings("", trimCr("\r"));
     // Only the last \r is stripped — embedded \r should pass through.
     try std.testing.expectEqualStrings("a\rb", trimCr("a\rb"));
+}
+
+// =============================================================================
+// Retry / Backoff Tests
+// =============================================================================
+//
+// We test the pure classification + parsing helpers in isolation. The
+// retry loop itself isn't easily unit-testable without a fake `Io`
+// (we'd need a mock that records sleep durations and a fake HTTP
+// transport that replays scripted responses). Instead we exercise the
+// loop in live runs via `log.info` retry traces — see `fetchWithRetry`.
+
+test "classifyHttpStatus retry-worthy codes" {
+    // Anthropic-specific: 429 (rate_limit_error), 529 (overloaded_error).
+    // 408 is also retried — it's almost always a transient client/server
+    // desync rather than a stable rejection.
+    try std.testing.expect(classifyHttpStatus(@enumFromInt(408)) == error.Transient);
+    try std.testing.expect(classifyHttpStatus(@enumFromInt(429)) == error.Transient);
+    try std.testing.expect(classifyHttpStatus(@enumFromInt(529)) == error.Transient);
+
+    // 5xx server errors: server is recovering, retrying typically helps.
+    try std.testing.expect(classifyHttpStatus(.internal_server_error) == error.Transient);
+    try std.testing.expect(classifyHttpStatus(.bad_gateway) == error.Transient);
+    try std.testing.expect(classifyHttpStatus(.service_unavailable) == error.Transient);
+    try std.testing.expect(classifyHttpStatus(.gateway_timeout) == error.Transient);
+}
+
+test "classifyHttpStatus permanent codes" {
+    // Anthropic 4xx errors: deterministic, retrying cannot help.
+    try std.testing.expect(classifyHttpStatus(.bad_request) == error.Permanent);
+    try std.testing.expect(classifyHttpStatus(.unauthorized) == error.Permanent);
+    try std.testing.expect(classifyHttpStatus(.payment_required) == error.Permanent);
+    try std.testing.expect(classifyHttpStatus(.forbidden) == error.Permanent);
+    try std.testing.expect(classifyHttpStatus(.not_found) == error.Permanent);
+    try std.testing.expect(classifyHttpStatus(.payload_too_large) == error.Permanent);
+    try std.testing.expect(classifyHttpStatus(.unprocessable_entity) == error.Permanent);
+
+    // 200 OK isn't a "failure" but exercises the else arm — classifying
+    // a success would be a programmer error in the call site, but the
+    // function should not panic on it.
+    try std.testing.expect(classifyHttpStatus(.ok) == error.Permanent);
+}
+
+test "parseRetryAfterSeconds parses integer seconds" {
+    try std.testing.expectEqual(@as(?u64, 5), parseRetryAfterSeconds("5"));
+    try std.testing.expectEqual(@as(?u64, 60), parseRetryAfterSeconds("60"));
+    try std.testing.expectEqual(@as(?u64, 0), parseRetryAfterSeconds("0"));
+    // Whitespace tolerated — RFC 7230 allows surrounding OWS.
+    try std.testing.expectEqual(@as(?u64, 30), parseRetryAfterSeconds("  30  "));
+    try std.testing.expectEqual(@as(?u64, 12), parseRetryAfterSeconds("\t12"));
+}
+
+test "parseRetryAfterSeconds rejects HTTP-date and garbage" {
+    // RFC 7231 § 7.1.3 also allows an HTTP-date format. We don't
+    // support it (Anthropic emits seconds), so we return null and the
+    // caller falls back to plain exponential backoff. Better than
+    // crashing on an unparseable date.
+    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("Wed, 21 Oct 2015 07:28:00 GMT"));
+    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds(""));
+    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("   "));
+    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("not-a-number"));
+    // Negative values are nonsensical for a delay; parseInt(u64) rejects.
+    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("-5"));
 }
