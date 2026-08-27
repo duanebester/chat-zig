@@ -29,6 +29,9 @@ pub fn build(b: *std.Build) void {
     // Zig 0.16 moved linkFramework off Compile steps; link it on the module.
     if (target.result.os.tag == .macos) {
         exe_mod.linkFramework("Security", .{});
+        exe_mod.linkFramework("CoreAudio", .{});
+        exe_mod.linkFramework("CoreFoundation", .{});
+        exe_mod.linkFramework("AudioToolbox", .{});
     }
 
     const exe = b.addExecutable(.{
@@ -79,6 +82,41 @@ pub fn build(b: *std.Build) void {
 
     const run_http_tests = b.addRunArtifact(http_tests);
 
+    // Same rationale as `http_test_mod`: narrow module, no gooey pulled in.
+    const openai_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/openai.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (target.result.os.tag == .macos) {
+        openai_test_mod.linkFramework("Security", .{});
+    }
+
+    const openai_tests = b.addTest(.{
+        .name = "openai-tests",
+        .root_module = openai_test_mod,
+    });
+    const run_openai_tests = b.addRunArtifact(openai_tests);
+
+    const audio_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/audio/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (target.result.os.tag == .macos) {
+        audio_test_mod.linkFramework("CoreAudio", .{});
+        audio_test_mod.linkFramework("CoreFoundation", .{});
+        audio_test_mod.linkFramework("AudioToolbox", .{});
+    }
+
+    const audio_tests = b.addTest(.{
+        .name = "audio-tests",
+        .root_module = audio_test_mod,
+    });
+    const run_audio_tests = b.addRunArtifact(audio_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_http_tests.step);
+    test_step.dependOn(&run_openai_tests.step);
+    test_step.dependOn(&run_audio_tests.step);
 }

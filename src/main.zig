@@ -5,6 +5,8 @@
 //!
 //! Prerequisites:
 //!   Set ANTHROPIC_API_KEY environment variable
+//!   Optionally set OPENAI_API_KEY to enable voice recording ->
+//!   text transcription (gpt-4o-mini-transcribe)
 //!
 //! Run with: zig build run
 //!
@@ -44,7 +46,7 @@ pub var process_io: std.Io = undefined;
 var state = AppState{};
 
 /// Handle global keyboard shortcuts
-fn onEvent(cx: *gooey.Cx, event: gooey.InputEvent) bool {
+fn onEvent(cx: *gooey.Cx, event: gooey.input.InputEvent) bool {
     switch (event) {
         .key_down => |k| {
             // Cmd+Q to quit
@@ -86,5 +88,5 @@ pub fn main(init: std.process.Init) !void {
     process_env = init.minimal.environ;
     process_io = init.io;
 
-    return App.main();
+    return App.main(init);
 }

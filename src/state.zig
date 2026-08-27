@@ -28,7 +28,10 @@ const gooey = @import("gooey");
 const file_dialog = gooey.file_dialog;
 
 const http = @import("http.zig");
-const VirtualListState = gooey.VirtualListState;
+const openai = @import("openai.zig");
+const audio = @import("audio/mod.zig");
+const VirtualListState = gooey.widgets.VirtualListState;
+const TextAreaState = gooey.widgets.TextAreaState;
 
 // Reach back into `main` for the process-global Io + environ published from
 // `std.process.Init`. `AppState.init` needs both but only receives a `*Cx`,
@@ -53,6 +56,66 @@ pub const MAX_ATTACHED_FILENAME_LEN: usize = 128;
 /// thumbnail fetch) and keeps the backing array small
 /// (`8 * @sizeOf(WorkerResult)`).
 pub const RESULT_QUEUE_CAPACITY: usize = 8;
+pub const RECORDING_PATH_MAX_LEN: usize = 128;
+
+const DEFAULT_DEVICE_MARKER = "\xe2\x97\x8f ";
+
+pub const MicrophoneState = struct {
+    devices: audio.InputDeviceList = .{},
+    labels: [audio.MAX_INPUT_DEVICES][]const u8 = undefined,
+    label_buffers: [audio.MAX_INPUT_DEVICES][DEFAULT_DEVICE_MARKER.len + audio.DEVICE_NAME_MAX_LEN]u8 = undefined,
+    selected: ?usize = null,
+
+    pub fn refresh(self: *MicrophoneState) void {
+        self.devices = audio.listInputDevices();
+        for (self.devices.slice(), 0..) |*device, device_index| {
+            const is_default = self.devices.default_index != null and self.devices.default_index.? == device_index;
+            if (is_default) {
+                self.labels[device_index] = std.fmt.bufPrint(
+                    &self.label_buffers[device_index],
+                    "{s}{s}",
+                    .{ DEFAULT_DEVICE_MARKER, device.name() },
+                ) catch device.name();
+            } else {
+                self.labels[device_index] = device.name();
+            }
+        }
+        self.selected = self.devices.default_index;
+
+        std.debug.assert(self.devices.count <= audio.MAX_INPUT_DEVICES);
+        if (self.selected) |selected| std.debug.assert(selected < self.devices.count);
+    }
+
+    pub fn options(self: *const MicrophoneState) []const []const u8 {
+        std.debug.assert(self.devices.count <= audio.MAX_INPUT_DEVICES);
+        std.debug.assert(self.labels.len == audio.MAX_INPUT_DEVICES);
+        return self.labels[0..self.devices.count];
+    }
+};
+
+pub const RecordingState = struct {
+    active: bool = false,
+    path_buffer: [RECORDING_PATH_MAX_LEN]u8 = undefined,
+    path_len: usize = 0,
+    last_error: ?audio.RecorderError = null,
+
+    pub fn path(self: *const RecordingState) []const u8 {
+        std.debug.assert(self.path_len <= RECORDING_PATH_MAX_LEN);
+        std.debug.assert(self.path_buffer.len == RECORDING_PATH_MAX_LEN);
+        return self.path_buffer[0..self.path_len];
+    }
+
+    fn preparePath(self: *RecordingState, io: std.Io) bool {
+        std.Io.Dir.cwd().createDirPath(io, "recordings") catch return false;
+        const seconds = std.Io.Timestamp.now(io, .real).toSeconds();
+        const output_path = std.fmt.bufPrint(&self.path_buffer, "recordings/{d}.wav", .{seconds}) catch return false;
+        self.path_len = output_path.len;
+
+        std.debug.assert(self.path_len > 0);
+        std.debug.assert(self.path_len <= RECORDING_PATH_MAX_LEN);
+        return true;
+    }
+};
 
 // =============================================================================
 // Model Selection
@@ -85,6 +148,43 @@ pub const Model = enum(u8) {
 };
 
 pub const MODEL_COUNT: usize = 3;
+
+// =============================================================================
+// Dictation Model Selection (OpenAI transcription)
+// =============================================================================
+
+pub const DictationModel = enum(u8) {
+    gpt4o_mini_transcribe,
+    gpt4o_transcribe,
+
+    pub const display_names = [_][]const u8{
+        "GPT-4o mini Transcribe",
+        "GPT-4o Transcribe",
+    };
+
+    pub const api_names = [_][]const u8{
+        "gpt-4o-mini-transcribe",
+        "gpt-4o-transcribe",
+    };
+
+    pub fn displayName(self: DictationModel) []const u8 {
+        return display_names[@intFromEnum(self)];
+    }
+
+    pub fn apiName(self: DictationModel) []const u8 {
+        return api_names[@intFromEnum(self)];
+    }
+};
+
+pub const DICTATION_MODEL_COUNT: usize = 2;
+
+// The default dictation model (index 0) must always match OpenAI's
+// hardcoded fallback in `openai.zig` — otherwise the Settings panel and
+// the client's own default would silently disagree about what "default"
+// means.
+comptime {
+    std.debug.assert(std.mem.eql(u8, DictationModel.api_names[0], openai.DEFAULT_TRANSCRIBE_MODEL));
+}
 
 // =============================================================================
 // Message Types
@@ -197,6 +297,19 @@ pub const WorkerResult = union(enum) {
     chat_delta: DeltaResult,
     chat_success: SuccessResult,
     chat_error: ErrorResult,
+    transcription_success: TranscriptionSuccessResult,
+    transcription_error: TranscriptionErrorResult,
+};
+
+/// `text_len` bounds a read of `AppState.pending_transcript_buf` — the
+/// worker copies the transcript there (capped at `MAX_INPUT_LEN`) before
+/// publishing this result, mirroring `SuccessResult.response_len`.
+pub const TranscriptionSuccessResult = struct {
+    text_len: u32,
+};
+
+pub const TranscriptionErrorResult = struct {
+    message: []const u8, // static, never freed
 };
 
 // =============================================================================
@@ -225,10 +338,16 @@ pub const AppState = struct {
     list_state: VirtualListState = VirtualListState.initWithGap(0, DEFAULT_MESSAGE_HEIGHT, 8),
     is_loading: bool = false,
     has_api_key: bool = false,
+    has_openai_api_key: bool = false,
+    is_transcribing: bool = false,
     error_message: ?[]const u8 = null,
     dark_mode: bool = true, // Start in dark mode like the reference image.
+    settings_expanded: bool = false,
 
     selected_model: Model = .haiku,
+    selected_dictation_model: DictationModel = .gpt4o_mini_transcribe,
+    microphone: MicrophoneState = .{},
+    recording: RecordingState = .{},
 
     // =========================================================================
     // File Attachment State
@@ -238,9 +357,19 @@ pub const AppState = struct {
     has_attached_file: bool = false,
 
     // =========================================================================
-    // HTTP Client (borrows `std.Io` from main)
+    // HTTP Clients (borrow `std.Io` from main)
     // =========================================================================
     http_client: ?http.AnthropicClient = null,
+    openai_client: ?openai.OpenAIClient = null,
+
+    // Transcript text staged by `transcriptionWorker`, capped at
+    // `MAX_INPUT_LEN` since it flows straight into the chat input box.
+    // Same threading discipline as the staging buffers below: written by
+    // the worker before `putOne`, read by the render thread only after
+    // the matching `WorkerResult` is drained.
+    pending_transcript_buf: [MAX_INPUT_LEN]u8 = undefined,
+    pending_transcript_len: usize = 0,
+    pending_transcription: ?std.Io.Future(void) = null,
 
     // =========================================================================
     // Staging Buffers (written by worker, read by render after queue drain)
@@ -316,11 +445,10 @@ pub const AppState = struct {
     // Framework handles
     // =========================================================================
     //
-    // `gooey_ptr` is retained (despite the dispatcher going away) so workers
-    // can nudge the event loop via `g.requestRender()` — that call is
-    // threadsafe by contract and does not touch any shared state, it just
-    // wakes the run loop so the next frame drains the queue.
-    gooey_ptr: ?*gooey.Gooey = null,
+    // `window_ptr` is retained so workers can nudge the event loop via
+    // `requestRender()`. That call is threadsafe by contract and does not touch
+    // shared state; it only wakes the run loop so the next frame drains the queue.
+    window_ptr: ?*gooey.Window = null,
 
     // =========================================================================
     // Initialization
@@ -328,11 +456,11 @@ pub const AppState = struct {
 
     pub fn init(cx: *gooey.Cx) void {
         const self = cx.state(Self);
-        const g = cx.gooey();
-        self.gooey_ptr = g;
+        const window = cx.window();
+        self.window_ptr = window;
 
         // Set initial window appearance from the persisted dark_mode flag.
-        g.setAppearance(self.dark_mode);
+        window.setAppearance(self.dark_mode);
 
         // Wire up the async plumbing. The queue is built in place; its
         // backing buffer already lives at its final address on AppState (we
@@ -345,6 +473,7 @@ pub const AppState = struct {
         // process; AppState is module-static so there is no teardown
         // for a stray worker to race against.
         self.result_queue = std.Io.Queue(WorkerResult).init(&self.result_buffer);
+        self.microphone.refresh();
 
         // Look up the API key through the environ published by `main`. On
         // macOS this replaces libc's `getenv`, which `std.posix` no longer
@@ -364,6 +493,23 @@ pub const AppState = struct {
             log.info("Anthropic API key found", .{});
         } else {
             log.warn("ANTHROPIC_API_KEY not set", .{});
+        }
+
+        // OpenAI key is optional — it only gates voice-recording
+        // transcription (`gpt-4o-mini-transcribe`), not core chat
+        // functionality, so a missing key is a warning, not a blocker.
+        const openai_api_key = main_mod.process_env.getPosix("OPENAI_API_KEY");
+        self.has_openai_api_key = openai_api_key != null and openai_api_key.?.len > 0;
+
+        if (self.has_openai_api_key) {
+            self.openai_client = openai.OpenAIClient.init(
+                openai_api_key.?,
+                std.heap.page_allocator,
+                main_mod.process_io,
+            );
+            log.info("OpenAI API key found", .{});
+        } else {
+            log.warn("OPENAI_API_KEY not set (voice transcription disabled)", .{});
         }
     }
 
@@ -473,8 +619,8 @@ pub const AppState = struct {
     // Send Message — launches an async worker via Io.Group
     // =========================================================================
 
-    pub fn sendMessage(self: *Self, g: *gooey.Gooey) void {
-        self.gooey_ptr = g;
+    pub fn sendMessage(self: *Self, window: *gooey.Window) void {
+        self.window_ptr = window;
 
         if (self.input_slice.len == 0) return;
         // Single-flight: swallow a second click while the first request is
@@ -505,8 +651,8 @@ pub const AppState = struct {
 
         // Clear input + attachment from the UI.
         self.input_slice = "";
-        if (g.textArea("chat-input")) |ta| {
-            ta.clear();
+        if (window.widgetState(TextAreaState, "chat-input")) |text_area| {
+            text_area.clear();
         }
         self.has_attached_file = false;
         self.attached_file_path_len = 0;
@@ -517,7 +663,7 @@ pub const AppState = struct {
         if (self.http_client == null) {
             self.error_message = "No API key configured";
             self.is_loading = false;
-            g.requestRender();
+            window.requestRender();
             return;
         }
 
@@ -543,7 +689,7 @@ pub const AppState = struct {
             &self.result_queue,
         });
 
-        g.requestRender();
+        window.requestRender();
     }
 
     // =========================================================================
@@ -576,7 +722,7 @@ pub const AppState = struct {
     ///      `streaming_message_idx = null`, `error_message = null`. The
     ///      partial assistant bubble stays in the message history; the
     ///      user can see what they got before stopping.
-    pub fn cancelInFlight(self: *Self, g: *gooey.Gooey) void {
+    pub fn cancelInFlight(self: *Self, window: *gooey.Window) void {
         if (self.pending_request == null) return;
         std.debug.assert(self.is_loading);
 
@@ -607,7 +753,7 @@ pub const AppState = struct {
         self.error_message = null;
 
         log.info("Streaming request cancelled by user", .{});
-        g.requestRender();
+        window.requestRender();
     }
 
     // =========================================================================
@@ -736,13 +882,54 @@ pub const AppState = struct {
         app.requestRenderFromWorker();
     }
 
+    /// Transcribes a just-finished recording via the user's selected
+    /// OpenAI transcription model (see `DictationModel`) and stages the
+    /// result for the render thread. `path_buf`/`path_len` are a value
+    /// copy of the recording's path — NOT a live view into
+    /// `app.recording.path_buffer` — because a new recording could start
+    /// (and overwrite that buffer) while this transcription is still in
+    /// flight.
+    fn transcriptionWorker(
+        io: std.Io,
+        client: *openai.OpenAIClient,
+        app: *Self,
+        queue: *std.Io.Queue(WorkerResult),
+        path_buf: [RECORDING_PATH_MAX_LEN]u8,
+        path_len: usize,
+        dictation_model: DictationModel,
+    ) void {
+        std.debug.assert(path_len > 0);
+        std.debug.assert(path_len <= RECORDING_PATH_MAX_LEN);
+
+        var result = client.transcribeFile(path_buf[0..path_len], dictation_model.apiName());
+        defer result.deinit(client.allocator);
+
+        const outcome: WorkerResult = switch (result.status) {
+            .success => |text| blk: {
+                // Cap to MAX_INPUT_LEN — the transcript flows straight into
+                // the chat input box, which enforces the same bound.
+                const capped_len = @min(text.len, MAX_INPUT_LEN);
+                @memcpy(app.pending_transcript_buf[0..capped_len], text[0..capped_len]);
+                app.pending_transcript_len = capped_len;
+                break :blk .{ .transcription_success = .{ .text_len = @intCast(capped_len) } };
+            },
+            .err => |msg| .{ .transcription_error = .{ .message = msg } },
+        };
+
+        queue.putOne(io, outcome) catch |e| {
+            log.debug("transcriptionWorker: terminal result dropped ({t})", .{e});
+        };
+
+        app.requestRenderFromWorker();
+    }
+
     /// Request a render from a worker fiber. Safe to call from any thread —
     /// `Gooey.requestRender` is threadsafe by contract and only nudges the
     /// event loop; the actual result delivery still flows through the
     /// Io.Queue drain on the main thread.
     fn requestRenderFromWorker(self: *Self) void {
-        const g = self.gooey_ptr orelse return;
-        g.requestRender();
+        const window = self.window_ptr orelse return;
+        window.requestRender();
     }
 
     // =========================================================================
@@ -760,11 +947,14 @@ pub const AppState = struct {
         var buf: [RESULT_QUEUE_CAPACITY]WorkerResult = undefined;
         const drained = cx.drainQueue(WorkerResult, &self.result_queue, &buf);
         std.debug.assert(drained.len <= RESULT_QUEUE_CAPACITY);
+        const window = cx.window();
         for (drained) |r| {
             switch (r) {
                 .chat_delta => |d| self.applyChatDelta(d),
                 .chat_success => |ok| self.applyChatSuccess(ok),
                 .chat_error => |err| self.applyChatError(err),
+                .transcription_success => |ok| self.applyTranscriptionSuccess(ok, window),
+                .transcription_error => |err| self.applyTranscriptionError(err),
             }
         }
     }
@@ -792,6 +982,7 @@ pub const AppState = struct {
 
         const idx = self.streaming_message_idx.?;
         std.debug.assert(idx < self.message_count);
+        const follow_stream = self.list_state.isScrolledToBottom(2.0);
 
         // Compute the slot in the underlying ring and grow the message in
         // place. Worker only appends, so `cumulative_len` only goes up;
@@ -812,9 +1003,11 @@ pub const AppState = struct {
         // list will re-measure on the next render pass.
         self.messages[ring_idx].cached_height = 0.0;
 
-        // Keep the freshly-grown message visible. `scrollToBottom` is
-        // idempotent and cheap.
-        self.list_state.scrollToBottom();
+        // Follow new content only while the viewport was already at the end.
+        // Once the user scrolls upward, streamed deltas preserve that position.
+        if (follow_stream) {
+            self.list_state.scrollToBottom();
+        }
     }
 
     /// Await and clear the in-flight worker `Future`. Idempotent — safe
@@ -874,35 +1067,185 @@ pub const AppState = struct {
         self.is_loading = false;
     }
 
+    /// Await and clear the in-flight transcription `Future`. Same
+    /// rationale as `awaitPendingRequest` — required so the `Io`
+    /// implementation can release the worker task's bookkeeping.
+    fn awaitPendingTranscription(self: *Self) void {
+        if (self.pending_transcription == null) return;
+        const io = main_mod.process_io;
+        self.pending_transcription.?.await(io);
+        self.pending_transcription = null;
+    }
+
+    /// Drops the transcribed text into the chat input box, replacing
+    /// whatever was there. Updates both the bound model (`input_slice`,
+    /// backed by the fixed `input_text` buffer — no heap allocation) and
+    /// the live widget directly, so the change is visible this frame
+    /// rather than lagging one frame behind the next `syncBoundText`
+    /// reconciliation. Mirrors the clear-on-send pattern in `sendMessage`.
+    fn applyTranscriptionSuccess(self: *Self, r: TranscriptionSuccessResult, window: *gooey.Window) void {
+        std.debug.assert(r.text_len > 0);
+        std.debug.assert(r.text_len <= MAX_INPUT_LEN);
+
+        self.awaitPendingTranscription();
+        self.is_transcribing = false;
+        self.error_message = null;
+
+        const text_len: usize = @intCast(r.text_len);
+        std.debug.assert(text_len <= self.pending_transcript_buf.len);
+        @memcpy(self.input_text[0..text_len], self.pending_transcript_buf[0..text_len]);
+        self.input_slice = self.input_text[0..text_len];
+
+        if (window.widgetState(TextAreaState, "chat-input")) |text_area| {
+            text_area.setText(self.input_slice) catch {};
+        }
+    }
+
+    fn applyTranscriptionError(self: *Self, e: TranscriptionErrorResult) void {
+        self.awaitPendingTranscription();
+        self.is_transcribing = false;
+        self.error_message = e.message;
+    }
+
     // =========================================================================
     // Theme / Model Toggles
     // =========================================================================
 
-    pub fn toggleDarkMode(self: *Self, g: *gooey.Gooey) void {
+    pub fn toggleDarkMode(self: *Self, window: *gooey.Window) void {
         self.dark_mode = !self.dark_mode;
-        g.setAppearance(self.dark_mode);
-        g.requestRender();
+        window.setAppearance(self.dark_mode);
+        window.requestRender();
+    }
+
+    pub fn toggleSettings(self: *Self, window: *gooey.Window) void {
+        std.debug.assert(self.microphone.devices.count <= audio.MAX_INPUT_DEVICES);
+        std.debug.assert(self.message_count <= MAX_MESSAGES);
+        self.settings_expanded = !self.settings_expanded;
+        window.requestRender();
     }
 
     pub fn selectModel(self: *Self, index: usize) void {
         self.selected_model = @enumFromInt(index);
     }
 
+    pub fn selectDictationModel(self: *Self, index: usize) void {
+        std.debug.assert(index < DICTATION_MODEL_COUNT);
+        std.debug.assert(index < DictationModel.api_names.len);
+        self.selected_dictation_model = @enumFromInt(index);
+    }
+
+    pub fn selectMicrophone(self: *Self, index: usize) void {
+        std.debug.assert(index < self.microphone.devices.count);
+        std.debug.assert(index < audio.MAX_INPUT_DEVICES);
+        self.microphone.selected = index;
+    }
+
+    pub fn refreshMicrophones(self: *Self, window: *gooey.Window) void {
+        std.debug.assert(self.microphone.devices.count <= audio.MAX_INPUT_DEVICES);
+        std.debug.assert(!self.recording.active);
+        self.microphone.refresh();
+        window.requestRender();
+    }
+
+    pub fn toggleRecording(self: *Self, window: *gooey.Window) void {
+        std.debug.assert(self.microphone.devices.count <= audio.MAX_INPUT_DEVICES);
+        std.debug.assert(self.recording.path_len <= RECORDING_PATH_MAX_LEN);
+
+        if (self.recording.active) {
+            self.recording.active = false;
+            if (audio.stopRecording()) |_| {
+                self.recording.last_error = null;
+                self.startTranscription(window);
+            } else |capture_error| {
+                self.recording.last_error = capture_error;
+            }
+            window.requestRender();
+            return;
+        }
+
+        const selected = self.microphone.selected orelse return;
+        std.debug.assert(selected < self.microphone.devices.count);
+        const device = self.microphone.devices.slice()[selected];
+
+        if (!self.recording.preparePath(main_mod.process_io)) {
+            self.recording.last_error = error.FileError;
+            return;
+        }
+
+        audio.startRecording(main_mod.process_io, device, self.recording.path()) catch |capture_error| {
+            self.recording.last_error = capture_error;
+            return;
+        };
+
+        self.recording.last_error = null;
+        self.recording.active = true;
+        window.requestRender();
+    }
+
+    /// Kicks off background transcription of the just-finished recording
+    /// via the user's selected OpenAI transcription model (`DictationModel`,
+    /// configurable in Settings). No-op if no OpenAI key is configured, or
+    /// the recording never got a path (both defensive — `toggleRecording`
+    /// only calls this after a successful `stopRecording`) — voice
+    /// recording works fine without transcription, it's a bonus.
+    ///
+    /// Copies the recording path into a value buffer rather than passing a
+    /// view into `self.recording.path_buffer`: that buffer gets overwritten
+    /// by `preparePath` the moment a new recording starts, which the UI
+    /// otherwise allows (the record button is only disabled while a
+    /// transcription is in flight — see `can_record` in `layout.zig`, and
+    /// `is_transcribing` closes that window, but the copy is cheap
+    /// insurance against future UI changes reopening it).
+    fn startTranscription(self: *Self, window: *gooey.Window) void {
+        std.debug.assert(!self.is_transcribing);
+        std.debug.assert(self.pending_transcription == null);
+
+        if (self.openai_client == null) return;
+        if (self.recording.path_len == 0) return;
+
+        var path_buf: [RECORDING_PATH_MAX_LEN]u8 = undefined;
+        const path_len = self.recording.path_len;
+        @memcpy(path_buf[0..path_len], self.recording.path());
+
+        self.is_transcribing = true;
+        self.error_message = null;
+        self.window_ptr = window;
+
+        const io = main_mod.process_io;
+        self.pending_transcription = io.async(transcriptionWorker, .{
+            io,
+            &self.openai_client.?,
+            self,
+            &self.result_queue,
+            path_buf,
+            path_len,
+            self.selected_dictation_model,
+        });
+
+        window.requestRender();
+    }
+
+    pub fn microphoneLevels(_: *const Self) [audio.WAVEFORM_BAR_COUNT]f32 {
+        const levels = audio.waveformLevels();
+        std.debug.assert(levels.len == audio.WAVEFORM_BAR_COUNT);
+        std.debug.assert(audio.WAVEFORM_BAR_COUNT > 0);
+        return levels;
+    }
+
     // =========================================================================
+    // File Attachments
     // File Attachment Handlers
     // =========================================================================
 
-    pub fn openFileDialog(self: *Self, g: *gooey.Gooey) void {
+    pub fn openFileDialog(self: *Self, window: *gooey.Window) void {
         _ = self;
         // Defer to avoid deadlock — the native file dialog blocks and
         // processes events, which can re-enter input handlers while the
         // render mutex is held.
-        g.deferCommand(Self.openFileDialogDeferred);
+        window.deferCommand(Self.openFileDialogDeferred);
     }
 
-    fn openFileDialogDeferred(self: *Self, g: *gooey.Gooey) void {
-        _ = g;
-
+    fn openFileDialogDeferred(self: *Self, _: *gooey.Window) void {
         if (file_dialog.promptForPaths(std.heap.page_allocator, .{
             .files = true,
             .directories = false,
@@ -926,7 +1269,7 @@ pub const AppState = struct {
         }
     }
 
-    pub fn clearAttachedFile(self: *Self, _: *gooey.Gooey) void {
+    pub fn clearAttachedFile(self: *Self, _: *gooey.Window) void {
         self.has_attached_file = false;
         self.attached_file_path_len = 0;
     }

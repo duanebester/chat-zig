@@ -387,7 +387,7 @@ pub const FetchError = error{
 /// Request, 401 invalid key). `transient` means "wait and retry", with
 /// an optional `Retry-After` seconds override extracted from the
 /// response header.
-fn AttemptOutcome(comptime T: type) type {
+pub fn AttemptOutcome(comptime T: type) type {
     return union(enum) {
         terminal: T,
         transient: ?u64,
@@ -399,7 +399,7 @@ fn AttemptOutcome(comptime T: type) type {
 /// timeout) is also retried — almost always a transient client/server
 /// desync. 4xx other than 408/429 are permanent (bad request, auth,
 /// payload-too-large, etc.); 5xx other than 529 is transient.
-fn classifyHttpStatus(status: http.Status) FetchError {
+pub fn classifyHttpStatus(status: http.Status) FetchError {
     // 529 is inside 500..599 — list it in the comment, not the match,
     // so the switch has no duplicate values.
     return switch (@intFromEnum(status)) {
@@ -414,7 +414,7 @@ fn classifyHttpStatus(status: http.Status) FetchError {
 /// Classify errors returned by `http.Client.request()`. OOM and
 /// programmer-error variants (unsupported URI scheme) are permanent;
 /// connect/DNS/TLS failures are transient.
-fn classifyRequestError(err: anyerror) FetchError {
+pub fn classifyRequestError(err: anyerror) FetchError {
     return switch (err) {
         error.OutOfMemory,
         error.UnsupportedUriScheme,
@@ -430,7 +430,7 @@ fn classifyRequestError(err: anyerror) FetchError {
 /// Classify errors returned by `Request.receiveHead()`. Malformed HTTP
 /// and redirect-shape errors are deterministic protocol breakage — the
 /// server won't suddenly start speaking HTTP correctly on retry.
-fn classifyReceiveHeadError(err: anyerror) FetchError {
+pub fn classifyReceiveHeadError(err: anyerror) FetchError {
     return switch (err) {
         error.HttpHeadersInvalid,
         error.TooManyHttpRedirects,
@@ -466,7 +466,7 @@ fn parseRetryAfterSeconds(value: []const u8) ?u64 {
 /// `retry-after` but we don't rely on that. Returns null if missing or
 /// unparseable. Must be called BEFORE `response.reader()` since that
 /// invalidates the head's slices.
-fn parseRetryAfterFromHead(head: http.Client.Response.Head) ?u64 {
+pub fn parseRetryAfterFromHead(head: http.Client.Response.Head) ?u64 {
     var it = head.iterateHeaders();
     while (it.next()) |hdr| {
         if (eqlIgnoreCase(hdr.name, "retry-after")) {
@@ -482,7 +482,7 @@ fn parseRetryAfterFromHead(head: http.Client.Response.Head) ?u64 {
 /// `max(retry_after, exp_jittered)` so the header lengthens our wait
 /// when the server explicitly asked for it, but we never shorten the
 /// jittered backoff.
-fn computeBackoffMs(attempt: u32, retry_after_s: ?u64, rng: std.Random) i64 {
+pub fn computeBackoffMs(attempt: u32, retry_after_s: ?u64, rng: std.Random) i64 {
     std.debug.assert(attempt < 63);
     const base_ms: u64 = BASE_BACKOFF_MS << @as(u6, @intCast(attempt));
 
@@ -518,14 +518,16 @@ fn computeBackoffMs(attempt: u32, retry_after_s: ?u64, rng: std.Random) i64 {
 /// Cancellation: `error.Canceled` propagates from either the attempt
 /// itself (via `try`) or the backoff sleep, unwinding cleanly to the
 /// worker. The Stop button stays responsive throughout.
-fn fetchWithRetry(
+pub fn fetchWithRetry(
     comptime T: type,
     io: Io,
     rng: std.Random,
     ctx: anytype,
     give_up: T,
+    label: []const u8,
 ) Io.Cancelable!T {
     comptime std.debug.assert(MAX_FETCH_ATTEMPTS > 0);
+    std.debug.assert(label.len > 0);
 
     var attempt: u32 = 0;
     while (attempt < MAX_FETCH_ATTEMPTS) : (attempt += 1) {
@@ -535,16 +537,17 @@ fn fetchWithRetry(
                 // Last attempt — sleeping just to give up wastes time.
                 if (attempt + 1 >= MAX_FETCH_ATTEMPTS) {
                     log.info(
-                        "Anthropic request: transient failure on final attempt {d}/{d}, giving up",
-                        .{ attempt + 1, MAX_FETCH_ATTEMPTS },
+                        "{s} request: transient failure on final attempt {d}/{d}, giving up",
+                        .{ label, attempt + 1, MAX_FETCH_ATTEMPTS },
                     );
                     return give_up;
                 }
 
                 const sleep_ms = computeBackoffMs(attempt, retry_after_s, rng);
                 log.info(
-                    "Anthropic request: transient failure on attempt {d}/{d}, backing off {d}ms{s}",
+                    "{s} request: transient failure on attempt {d}/{d}, backing off {d}ms{s}",
                     .{
+                        label,
                         attempt + 1,
                         MAX_FETCH_ATTEMPTS,
                         sleep_ms,
@@ -566,7 +569,7 @@ fn fetchWithRetry(
 /// `gooey/src/image/loader.zig`), so we use a fresh timestamp seed
 /// per call. Determinism per-call is not a requirement — independence
 /// across concurrent retries is.
-fn seedBackoffPrng(io: Io) std.Random.DefaultPrng {
+pub fn seedBackoffPrng(io: Io) std.Random.DefaultPrng {
     const ts = Io.Clock.Timestamp.now(io, .awake);
     const nanos: i96 = ts.raw.toNanoseconds();
     const seed: u64 = @bitCast(@as(i64, @truncate(nanos)));
@@ -701,6 +704,7 @@ pub fn uploadFileToFilesApi(
         prng.random(),
         ctx,
         FileUploadResult.err("File upload failed after retries"),
+        "Anthropic",
     ) catch FileUploadResult.err("File upload cancelled");
 }
 
@@ -1192,6 +1196,7 @@ pub const AnthropicClient = struct {
             prng.random(),
             ctx,
             ChatResult.err("Request failed after retries"),
+            "Anthropic",
         );
     }
 
