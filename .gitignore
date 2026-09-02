@@ -5,3 +5,7 @@ zig-pkg/
 *.a
 *.dylib
 *.so
+
+recordings/
+sessions/
+.DS_Store

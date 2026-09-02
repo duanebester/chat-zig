@@ -25,6 +25,7 @@ const platform = gooey.platform;
 
 const state_mod = @import("state.zig");
 const layout = @import("layout.zig");
+const thinking_shader = @import("thinking_shader.zig");
 
 pub const AppState = state_mod.AppState;
 
@@ -78,6 +79,9 @@ const App = gooey.App(AppState, &state, layout.render, .{
     .init = AppState.init,
     // Handle global keyboard shortcuts
     .on_event = onEvent,
+    // Full-frame rim glow while the assistant is thinking. Gated at runtime
+    // by `thinking_shader.drive` — see that file for the accent-alpha trick.
+    .custom_shaders = &.{.{ .msl = thinking_shader.msl }},
 });
 
 pub fn main(init: std.process.Init) !void {
