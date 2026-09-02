@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     // Tests
     // =========================================================================
     //
-    // `zig build test` runs the unit tests embedded in `src/http.zig`
+    // `zig build test` runs the unit tests embedded in `src/http/anthropic.zig`
     // (JSON escaping, response parsing, MIME type detection, base64, file
     // upload lifecycle, etc.). The tests don't hit the network — they
     // validate the pure helpers — so they're fast and safe to run on every
@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
     // keeps `zig build test` under a second.
 
     const http_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/http.zig"),
+        .root_source_file = b.path("src/http/anthropic.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
 
     // Same rationale as `http_test_mod`: narrow module, no gooey pulled in.
     const openai_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/openai.zig"),
+        .root_source_file = b.path("src/http/openai.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -115,8 +115,59 @@ pub fn build(b: *std.Build) void {
     });
     const run_audio_tests = b.addRunArtifact(audio_tests);
 
+    // `session_log.zig` imports `http/anthropic.zig` (to reuse
+    // `writeJsonEscapedString`), so it needs the same Security link as
+    // `http_test_mod` on macOS, but stays gooey-free like the others above.
+    const session_log_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/session_log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (target.result.os.tag == .macos) {
+        session_log_test_mod.linkFramework("Security", .{});
+    }
+
+    const session_log_tests = b.addTest(.{
+        .name = "session-log-tests",
+        .root_module = session_log_test_mod,
+    });
+    const run_session_log_tests = b.addRunArtifact(session_log_tests);
+
+    // `compaction.zig` is deliberately primitives-only (no gooey, no
+    // `std.Io`) precisely so its cut arithmetic can be tested here rather
+    // than inside `state.zig`, which would drag Metal/CoreText/AppKit into
+    // a test run that needs none of it.
+    const compaction_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/compaction.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const compaction_tests = b.addTest(.{
+        .name = "compaction-tests",
+        .root_module = compaction_test_mod,
+    });
+    const run_compaction_tests = b.addRunArtifact(compaction_tests);
+
+    // Pure std-only helper, no framework links needed — same rationale as
+    // the other narrow test modules above.
+    const date_format_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/date_format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const date_format_tests = b.addTest(.{
+        .name = "date-format-tests",
+        .root_module = date_format_test_mod,
+    });
+    const run_date_format_tests = b.addRunArtifact(date_format_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_openai_tests.step);
     test_step.dependOn(&run_audio_tests.step);
+    test_step.dependOn(&run_session_log_tests.step);
+    test_step.dependOn(&run_compaction_tests.step);
+    test_step.dependOn(&run_date_format_tests.step);
 }

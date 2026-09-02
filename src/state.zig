@@ -27,10 +27,14 @@ const log = std.log.scoped(.chatzig);
 const gooey = @import("gooey");
 const file_dialog = gooey.file_dialog;
 
-const http = @import("http.zig");
-const openai = @import("openai.zig");
+const anthropic = @import("http/anthropic.zig");
+const openai = @import("http/openai.zig");
 const audio = @import("audio/mod.zig");
+const compaction = @import("compaction.zig");
+const session_log_mod = @import("session_log.zig");
+const SessionLog = session_log_mod.SessionLog;
 const VirtualListState = gooey.widgets.VirtualListState;
+const UniformListState = gooey.widgets.UniformListState;
 const TextAreaState = gooey.widgets.TextAreaState;
 
 // Reach back into `main` for the process-global Io + environ published from
@@ -58,7 +62,39 @@ pub const MAX_ATTACHED_FILENAME_LEN: usize = 128;
 pub const RESULT_QUEUE_CAPACITY: usize = 8;
 pub const RECORDING_PATH_MAX_LEN: usize = 128;
 
+/// Row height for the history panel's uniform list (see `HistoryPanel`).
+/// Lives here, next to `DEFAULT_MESSAGE_HEIGHT`, because both size a list
+/// state that `AppState` owns and must initialize up front.
+pub const HISTORY_ROW_HEIGHT: f32 = 56.0;
+pub const HISTORY_ROW_GAP: f32 = 8.0;
+
+const CHAT_SYSTEM_INSTRUCTION =
+    "Respond in plain text only. Do not use Markdown or other markup. " ++
+    "Do not use headings, bullet points, numbered lists, emphasis markers, backticks, code fences, or Markdown links. " ++
+    "Keep responses readable with plain sentences, line breaks, and indentation only.";
+
 const DEFAULT_DEVICE_MARKER = "\xe2\x97\x8f ";
+
+// =============================================================================
+// Compaction (see docs/CHAT_COMPACTION.md)
+// =============================================================================
+//
+// Compaction never mutates `messages`. The ring stays the UI transcript;
+// the summary is a derived cache that only affects *request assembly*, so
+// `streaming_message_idx`, every `cached_height`, and `list_state`'s item
+// count all stay valid across a compaction. Failure is therefore free:
+// leave `summary_len` alone and the next request is simply the
+// uncompacted one.
+//
+// The tuning constants, prompts, and cut arithmetic live in
+// `compaction.zig` so they can be unit-tested without pulling gooey into
+// the test binary; what stays here is the part that needs the ring.
+
+pub const MAX_SUMMARY_LEN = compaction.MAX_SUMMARY_LEN;
+
+/// Longest banner `AppState.compactionBanner` can format — the template
+/// plus a u64 rendered in full.
+const COMPACTION_BANNER_MAX_LEN: usize = 96;
 
 pub const MicrophoneState = struct {
     devices: audio.InputDeviceList = .{},
@@ -121,21 +157,63 @@ pub const RecordingState = struct {
 // Model Selection
 // =============================================================================
 
+/// Which HTTP client (`AppState.http_client` vs `.openai_client`) and wire
+/// format a `Model` uses. Chat now spans both providers, so
+/// `buildAnthropicChatRequest` / `buildOpenAIChatRequest` and `sendMessage`
+/// branch on this instead of assuming Anthropic.
+pub const ModelProvider = enum(u8) {
+    anthropic,
+    openai,
+};
+
 pub const Model = enum(u8) {
     haiku,
     sonnet,
     opus,
+    gpt_sol,
+    gpt_terra,
+    gpt_luna,
 
     pub const display_names = [_][]const u8{
         "Claude 4.5 Haiku",
-        "Claude 4.5 Sonnet",
-        "Claude 4.5 Opus",
+        "Claude Sonnet 5",
+        "Claude Opus 5",
+        "GPT-5.6 Sol",
+        "GPT-5.6 Terra",
+        "GPT-5.6 Luna",
     };
 
     pub const api_names = [_][]const u8{
         "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-5-20250929",
-        "claude-opus-4-5-20251101",
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    };
+
+    /// Parallel array to `display_names`/`api_names` (table-driven, CLAUDE
+    /// rule #8) rather than a per-variant switch in `provider()` — keeping
+    /// all three arrays side by side makes it visually obvious that adding
+    /// a model means updating all three.
+    pub const providers = [_]ModelProvider{
+        .anthropic, .anthropic, .anthropic,
+        .openai,    .openai,    .openai,
+    };
+
+    /// Input context window, in tokens — the denominator
+    /// `compaction.TRIGGER_RATIO` is applied to.
+    ///
+    /// Distinct from `anthropic.MAX_TOKENS`, which caps *output* length.
+    /// The two are easy to confuse at a call site, hence the deliberately
+    /// different names.
+    ///
+    /// Conservative by design: this only decides *when* compaction fires,
+    /// and under-stating the window means compacting slightly early, which
+    /// is the harmless direction to be wrong in.
+    pub const context_window_tokens = [_]u32{
+        200_000, 200_000, 200_000,
+        272_000, 272_000, 272_000,
     };
 
     pub fn displayName(self: Model) []const u8 {
@@ -145,9 +223,24 @@ pub const Model = enum(u8) {
     pub fn apiName(self: Model) []const u8 {
         return api_names[@intFromEnum(self)];
     }
+
+    pub fn provider(self: Model) ModelProvider {
+        return providers[@intFromEnum(self)];
+    }
+
+    pub fn contextWindowTokens(self: Model) u32 {
+        return context_window_tokens[@intFromEnum(self)];
+    }
 };
 
-pub const MODEL_COUNT: usize = 3;
+pub const MODEL_COUNT: usize = 6;
+
+comptime {
+    std.debug.assert(Model.display_names.len == MODEL_COUNT);
+    std.debug.assert(Model.api_names.len == MODEL_COUNT);
+    std.debug.assert(Model.providers.len == MODEL_COUNT);
+    std.debug.assert(Model.context_window_tokens.len == MODEL_COUNT);
+}
 
 // =============================================================================
 // Dictation Model Selection (OpenAI transcription)
@@ -258,7 +351,7 @@ pub const SuccessResult = struct {
 
 pub const ErrorResult = struct {
     /// Static lifetime — either a compile-time string or a pointer into a
-    /// long-lived owned buffer on `http.ChatResult`. The queue never copies
+    /// long-lived owned buffer on `anthropic.ChatResult`. The queue never copies
     /// the bytes; it only carries the slice header.
     message: []const u8,
 };
@@ -297,8 +390,44 @@ pub const WorkerResult = union(enum) {
     chat_delta: DeltaResult,
     chat_success: SuccessResult,
     chat_error: ErrorResult,
+    compaction_applied: CompactionResult,
     transcription_success: TranscriptionSuccessResult,
     transcription_error: TranscriptionErrorResult,
+};
+
+/// Published by the worker after it has summarized the older half of the
+/// conversation, so the main thread — which owns the live `summary_*`
+/// fields — can adopt the new cut. Same staging discipline as
+/// `SuccessResult`: `summary_len` bounds a read of
+/// `AppState.pending_summary_buf`.
+///
+/// Fires at most once per send, always *before* the `chat_delta` /
+/// `chat_success` pair for that same send.
+pub const CompactionResult = struct {
+    summary_len: u32,
+    /// New value for `AppState.summary_covers`: every message with a
+    /// lower `seq` is now represented by the summary rather than sent
+    /// verbatim. Strictly greater than the previous cut — the worker
+    /// skips a compaction that would not advance it.
+    ///
+    /// This is the cut the worker *realized*, not the one
+    /// `compaction.proposedCovers` asked for. The two differ because
+    /// `retainedStart` snaps a cut forward onto a `.user` turn, so a
+    /// summary typically swallows a message or two past the proposal;
+    /// `planCompactionCut` converts that snapped boundary back into `seq`
+    /// space so the sentence above is literally true.
+    covers: u64,
+};
+
+/// Which prefix of history a request omits, and the summary standing in
+/// for it. Passed explicitly to the request builders rather than read off
+/// `AppState` because the worker may be using a summary it just computed
+/// and staged, which the main thread has not adopted yet.
+pub const CompactionView = struct {
+    /// Empty when nothing has been compacted, in which case `covers` is 0
+    /// and the builders send the whole ring.
+    summary: []const u8,
+    covers: u64,
 };
 
 /// `text_len` bounds a read of `AppState.pending_transcript_buf` — the
@@ -325,6 +454,46 @@ pub const AppState = struct {
     messages: [MAX_MESSAGES]Message = undefined,
     message_head: usize = 0,
     message_count: usize = 0,
+    /// Total number of messages ever added via `addMessage`, never reset
+    /// and never wraps. Used as the `seq` in the on-disk session log —
+    /// unlike a logical index into `messages`, it stays meaningful after
+    /// the ring buffer has overwritten the message it refers to.
+    messages_total: u64 = 0,
+
+    /// Append-only JSONL transcript of the conversation, one file per app
+    /// launch. Best-effort: see `session_log.zig` for the write-failure
+    /// contract (`session_log.write_failed`).
+    session_log: SessionLog = .{},
+
+    // =========================================================================
+    // Compaction state — a derived view, not a mutation of history
+    // =========================================================================
+    //
+    // Owned by the main thread. The worker stages a candidate in
+    // `pending_summary_buf` and publishes it as a `compaction_applied`
+    // result; `applyCompactionApplied` copies it here. Nothing below ever
+    // touches `messages`.
+
+    summary_buf: [MAX_SUMMARY_LEN]u8 = undefined,
+    summary_len: usize = 0,
+    /// Value of `messages_total` at the compaction cut: the summary covers
+    /// every message added before this point. Stored against the monotonic
+    /// counter rather than a logical index because logical indices decay —
+    /// once the ring overwrites, `getMessage(0)` means a different message
+    /// than it did before.
+    summary_covers: u64 = 0,
+
+    /// Scratch for `compactionBanner` to format into. Rewritten each time
+    /// the banner renders rather than kept in sync with `summary_covers`,
+    /// so there is no second source of truth to go stale.
+    compaction_banner_buf: [COMPACTION_BANNER_MAX_LEN]u8 = undefined,
+
+    /// Past sessions found under `sessions/*.jsonl`, newest first. Populated
+    /// by `refreshSessionHistory` when the history panel is opened rather
+    /// than kept live, since the on-disk directory only changes on app
+    /// launch (see `session_log.zig`'s "one file per launch" design).
+    session_entries: [session_log_mod.MAX_SESSION_ENTRIES]session_log_mod.SessionEntry = undefined,
+    session_entry_count: usize = 0,
 
     // =========================================================================
     // Input State
@@ -336,13 +505,24 @@ pub const AppState = struct {
     // UI State
     // =========================================================================
     list_state: VirtualListState = VirtualListState.initWithGap(0, DEFAULT_MESSAGE_HEIGHT, 8),
+    /// Backs the history panel's session list (see `HistoryPanel`). Rows are
+    /// uniform height, unlike `list_state`'s variable-height messages, so
+    /// this uses `UniformListState` rather than a second `VirtualListState`.
+    history_list_state: UniformListState = UniformListState.initWithGap(0, HISTORY_ROW_HEIGHT, HISTORY_ROW_GAP),
     is_loading: bool = false,
     has_api_key: bool = false,
     has_openai_api_key: bool = false,
     is_transcribing: bool = false,
     error_message: ?[]const u8 = null,
     dark_mode: bool = true, // Start in dark mode like the reference image.
+    /// When true, the content area shows `SettingsPanel` (a full-length
+    /// settings view) instead of `ContentArea`'s message list. Mutually
+    /// exclusive with `history_expanded` — see `toggleSettings`.
     settings_expanded: bool = false,
+    /// When true, the content area shows `HistoryPanel` (a full-length list
+    /// of past sessions) instead of `ContentArea`'s message list. Mutually
+    /// exclusive with `settings_expanded` — see `toggleHistory`.
+    history_expanded: bool = false,
 
     selected_model: Model = .haiku,
     selected_dictation_model: DictationModel = .gpt4o_mini_transcribe,
@@ -359,7 +539,7 @@ pub const AppState = struct {
     // =========================================================================
     // HTTP Clients (borrow `std.Io` from main)
     // =========================================================================
-    http_client: ?http.AnthropicClient = null,
+    http_client: ?anthropic.AnthropicClient = null,
     openai_client: ?openai.OpenAIClient = null,
 
     // Transcript text staged by `transcriptionWorker`, capped at
@@ -397,6 +577,9 @@ pub const AppState = struct {
     pending_file_path: [MAX_FILE_PATH_LEN]u8 = undefined,
     pending_file_path_len: usize = 0,
 
+    pending_summary_buf: [MAX_SUMMARY_LEN]u8 = undefined,
+    pending_summary_len: usize = 0,
+
     /// Ring-buffer index of the placeholder assistant `Message` we are
     /// currently streaming into, or `null` if no stream is in flight.
     ///
@@ -412,6 +595,13 @@ pub const AppState = struct {
     ///   * If `streaming_message_idx == i`, `getMessage(i).?.role` is
     ///     `.assistant` and `is_loading` is true.
     streaming_message_idx: ?u32 = null,
+
+    /// The `seq` (see `addMessage`) of the message `streaming_message_idx`
+    /// refers to, or `null` under the same conditions as that field.
+    /// Carried separately because the log write in `applyChatSuccess` /
+    /// `applyChatError` happens once the stream is final, long after
+    /// `addMessage` returned this value on the first delta.
+    streaming_message_seq: ?u64 = null,
 
     // =========================================================================
     // Async Result Plumbing — Zig 0.16 std.Io
@@ -482,10 +672,10 @@ pub const AppState = struct {
         self.has_api_key = api_key != null and api_key.?.len > 0;
 
         if (self.has_api_key) {
-            // AnthropicClient holds `std.Io` so it can spin up `http.Client`
+            // AnthropicClient holds `std.Io` so it can spin up `std.http.Client`
             // per request. `page_allocator` is threadsafe and thus safe to
             // hand to a fiber that runs on a worker thread.
-            self.http_client = http.AnthropicClient.init(
+            self.http_client = anthropic.AnthropicClient.init(
                 api_key.?,
                 std.heap.page_allocator,
                 main_mod.process_io,
@@ -495,9 +685,10 @@ pub const AppState = struct {
             log.warn("ANTHROPIC_API_KEY not set", .{});
         }
 
-        // OpenAI key is optional — it only gates voice-recording
-        // transcription (`gpt-4o-mini-transcribe`), not core chat
-        // functionality, so a missing key is a warning, not a blocker.
+        // OpenAI key is optional — Claude models still work without it, so
+        // a missing key is a warning, not a blocker. It now gates two
+        // things: voice-recording transcription (`DictationModel`) and the
+        // GPT chat models (`Model.provider() == .openai`).
         const openai_api_key = main_mod.process_env.getPosix("OPENAI_API_KEY");
         self.has_openai_api_key = openai_api_key != null and openai_api_key.?.len > 0;
 
@@ -509,7 +700,7 @@ pub const AppState = struct {
             );
             log.info("OpenAI API key found", .{});
         } else {
-            log.warn("OPENAI_API_KEY not set (voice transcription disabled)", .{});
+            log.warn("OPENAI_API_KEY not set (voice transcription and GPT models disabled)", .{});
         }
     }
 
@@ -517,9 +708,17 @@ pub const AppState = struct {
     // Message Management
     // =========================================================================
 
-    pub fn addMessage(self: *Self, msg: Message) void {
+    /// Appends `msg` to the ring buffer and returns the monotonic `seq`
+    /// assigned to it (the value of `messages_total` before this call),
+    /// for use as the `seq` field when the caller logs the turn via
+    /// `session_log`.
+    pub fn addMessage(self: *Self, msg: Message) u64 {
         std.debug.assert(self.message_count <= MAX_MESSAGES);
         std.debug.assert(self.message_head < MAX_MESSAGES);
+
+        const seq = self.messages_total;
+        self.messages_total += 1;
+        std.debug.assert(self.messages_total > seq);
 
         if (self.message_count < MAX_MESSAGES) {
             self.messages[(self.message_head + self.message_count) % MAX_MESSAGES] = msg;
@@ -544,6 +743,8 @@ pub const AppState = struct {
         // are either `sendMessage` or the render-loop drain).
         self.list_state.setItemCount(@intCast(self.message_count));
         self.list_state.scrollToBottom();
+
+        return seq;
     }
 
     pub fn getMessage(self: *const Self, i: usize) ?*const Message {
@@ -585,28 +786,193 @@ pub const AppState = struct {
     }
 
     // =========================================================================
+    // Compaction Cut
+    // =========================================================================
+
+    /// The compaction state the main thread currently holds. Workers start
+    /// from this and may replace it with a freshly computed one — see
+    /// `runCompaction`.
+    pub fn liveCompactionView(self: *const Self) CompactionView {
+        std.debug.assert(self.summary_len <= MAX_SUMMARY_LEN);
+        if (self.summary_len == 0) std.debug.assert(self.summary_covers == 0);
+        return .{
+            .summary = self.summary_buf[0..self.summary_len],
+            .covers = self.summary_covers,
+        };
+    }
+
+    /// Logical index of the first `.user` turn at or after `from`, or null
+    /// if the retained tail holds none.
+    fn firstUserAtOrAfter(self: *const Self, from: usize) ?usize {
+        std.debug.assert(from <= self.message_count);
+        var i = from;
+        while (i < self.message_count) : (i += 1) {
+            const msg = self.getMessage(i) orelse return null;
+            if (msg.role == .user) return i;
+        }
+        return null;
+    }
+
+    /// Logical index of the first message a request sends verbatim under
+    /// `covers`. Snapped forward to a `.user` turn, because Anthropic
+    /// requires the first message to be one — and it is exactly why the
+    /// summary rides in the `system` field rather than as a synthetic
+    /// leading message, which would collide with this turn.
+    ///
+    /// Falls back to 0 when the retained tail contains no user turn at all.
+    /// That cannot happen on the send path (`sendMessage` appends the
+    /// user's turn before launching the worker, so the tail always ends in
+    /// one), and sending uncompacted history is the same free failure mode
+    /// as a summarization request that errors out.
+    fn retainedStart(self: *const Self, covers: u64) usize {
+        std.debug.assert(self.message_count <= MAX_MESSAGES);
+        std.debug.assert(covers <= self.messages_total);
+
+        const raw = compaction.cutToIndex(.{
+            .covers = covers,
+            .messages_total = self.messages_total,
+            .message_count = @intCast(self.message_count),
+        });
+        const start = self.firstUserAtOrAfter(raw) orelse 0;
+        std.debug.assert(start <= self.message_count);
+        return start;
+    }
+
+    /// Heuristic token count for the request `view` would produce, plus
+    /// `attachment_bytes` for a staged file.
+    ///
+    /// Deliberately not the real `usage` numbers. On the streaming path —
+    /// the only one `httpWorker` uses — `usage` arrives in the
+    /// `message_start` and `message_delta` SSE events, both of which
+    /// `parseSseTextDelta` discards. Plumbing it through means extending
+    /// `SseEvent` and the `StreamSink` contract, which is the largest piece
+    /// of work in the whole feature and buys very little: this is a
+    /// threshold, not a bill.
+    ///
+    /// Counting the attachment, on the other hand, cannot be deferred:
+    /// files are inlined into the request by the client and never appear in
+    /// `messages`, so a single attached file dwarfs the entire text history
+    /// and would otherwise be invisible to the estimator.
+    fn estimatedTokens(self: *const Self, view: CompactionView, attachment_bytes: u64) u32 {
+        std.debug.assert(view.summary.len <= MAX_SUMMARY_LEN);
+
+        var chars: u64 = CHAT_SYSTEM_INSTRUCTION.len + view.summary.len + attachment_bytes;
+        var i = self.retainedStart(view.covers);
+        while (i < self.message_count) : (i += 1) {
+            const msg = self.getMessage(i) orelse break;
+            chars += msg.content_len;
+        }
+
+        return compaction.estimateTokens(chars);
+    }
+
+    // =========================================================================
     // Chat Request Assembly
     // =========================================================================
 
+    const SYSTEM_BUFFER_LEN: usize =
+        CHAT_SYSTEM_INSTRUCTION.len + compaction.SUMMARY_PREAMBLE.len + MAX_SUMMARY_LEN;
+
+    /// Composes the system instruction a request carries: the standing
+    /// plain-text rules, plus the compaction summary when there is one.
+    ///
+    /// The summary must not *replace* the formatting rules — that would
+    /// silently turn Markdown back on the moment a conversation got long
+    /// enough to compact — so the two are concatenated into `out`, whose
+    /// length is derived from both operands and therefore cannot overflow.
+    fn composeSystemInstruction(out: *[SYSTEM_BUFFER_LEN]u8, summary: []const u8) []const u8 {
+        if (summary.len == 0) return CHAT_SYSTEM_INSTRUCTION;
+        std.debug.assert(summary.len <= MAX_SUMMARY_LEN);
+
+        const head = CHAT_SYSTEM_INSTRUCTION ++ compaction.SUMMARY_PREAMBLE;
+        @memcpy(out[0..head.len], head);
+        @memcpy(out[head.len..][0..summary.len], summary);
+
+        const len = head.len + summary.len;
+        std.debug.assert(len <= out.len);
+        return out[0..len];
+    }
+
     const ChatMessagesBuffer = struct {
-        messages: [MAX_MESSAGES]http.ChatMessage = undefined,
+        messages: [MAX_MESSAGES]anthropic.ChatMessage = undefined,
         count: usize = 0,
+        /// Backs `composeSystemInstruction`'s output. Lives here so the
+        /// composed instruction has exactly the same lifetime as the
+        /// message slices the request borrows.
+        system_buf: [SYSTEM_BUFFER_LEN]u8 = undefined,
     };
 
-    fn buildChatRequest(self: *Self, buf: *ChatMessagesBuffer) http.ChatRequest {
+    /// Builds an Anthropic request. Only called when `selected_model.provider()
+    /// == .anthropic` (see `sendMessage`).
+    ///
+    /// `view` decides where the loop starts: under compaction the older
+    /// turns are omitted and `view.summary` stands in for them. It is a
+    /// parameter rather than a read of `summary_*` because the worker may
+    /// be using a summary it staged this very request, which the main
+    /// thread has not adopted yet.
+    fn buildAnthropicChatRequest(
+        self: *Self,
+        buf: *ChatMessagesBuffer,
+        view: CompactionView,
+    ) anthropic.ChatRequest {
         // Snapshot the ring buffer into a contiguous slice of ChatMessages.
         // Called from the worker fiber, but `is_loading` guards single-flight
         // so the main thread cannot mutate `messages` concurrently.
         buf.count = 0;
-        var i: usize = 0;
+        var i: usize = self.retainedStart(view.covers);
         while (i < self.message_count and buf.count < MAX_MESSAGES) : (i += 1) {
             const msg = self.getMessage(i) orelse break;
-            const role: http.ChatRole = switch (msg.role) {
+            const role: anthropic.ChatRole = switch (msg.role) {
                 .user => .user,
                 .assistant => .assistant,
                 .system => continue, // Anthropic takes system via a separate field.
             };
-            buf.messages[buf.count] = http.ChatMessage.text(role, msg.getText());
+            buf.messages[buf.count] = anthropic.ChatMessage.text(role, msg.getText());
+            buf.count += 1;
+        }
+        return .{
+            .model = self.selected_model.apiName(),
+            .messages = buf.messages[0..buf.count],
+            .system = composeSystemInstruction(&buf.system_buf, view.summary),
+        };
+    }
+
+    const OpenAIChatMessagesBuffer = struct {
+        messages: [MAX_MESSAGES]openai.ChatMessage = undefined,
+        count: usize = 0,
+        system_buf: [SYSTEM_BUFFER_LEN]u8 = undefined,
+    };
+
+    /// Builds an OpenAI Chat Completions request. Only called when
+    /// `selected_model.provider() == .openai` (see `sendMessage`).
+    ///
+    /// Unlike Anthropic, OpenAI has no separate top-level system field —
+    /// the composed instruction rides as the first message in the array
+    /// instead. `view` is honored here too: compaction only *runs* on the
+    /// Anthropic path (it summarizes with haiku), but a summary earned
+    /// there must not be thrown away just because the user switched models
+    /// mid-conversation.
+    fn buildOpenAIChatRequest(
+        self: *Self,
+        buf: *OpenAIChatMessagesBuffer,
+        view: CompactionView,
+    ) openai.ChatRequest {
+        buf.count = 0;
+        buf.messages[buf.count] = openai.ChatMessage.text(
+            .system,
+            composeSystemInstruction(&buf.system_buf, view.summary),
+        );
+        buf.count += 1;
+
+        var i: usize = self.retainedStart(view.covers);
+        while (i < self.message_count and buf.count < MAX_MESSAGES) : (i += 1) {
+            const msg = self.getMessage(i) orelse break;
+            const role: openai.ChatRole = switch (msg.role) {
+                .user => .user,
+                .assistant => .assistant,
+                .system => .system,
+            };
+            buf.messages[buf.count] = openai.ChatMessage.text(role, msg.getText());
             buf.count += 1;
         }
         return .{
@@ -625,8 +991,19 @@ pub const AppState = struct {
         if (self.input_slice.len == 0) return;
         // Single-flight: swallow a second click while the first request is
         // still outstanding. This is also what keeps the worker's snapshot
-        // read of `messages` race-free (see `buildChatRequest`).
+        // read of `messages` race-free (see `buildAnthropicChatRequest` /
+        // `buildOpenAIChatRequest`).
         if (self.is_loading) return;
+
+        // File attachments (images, PDFs) only exist on Anthropic's wire
+        // format today (Files API upload, base64 image blocks) — OpenAI
+        // chat support is text-only. Refuse up front, before touching
+        // history or clearing input, so the user can switch models or drop
+        // the attachment and retry without losing anything.
+        if (self.has_attached_file and self.selected_model.provider() == .openai) {
+            self.error_message = "File attachments aren't supported with GPT models yet — switch to a Claude model or remove the attachment";
+            return;
+        }
 
         // Capture the attached file path before clearing, so the worker
         // fiber reads from a stable staging slot rather than the live input
@@ -640,12 +1017,20 @@ pub const AppState = struct {
             );
         }
 
-        // Add the user's message to the visible history.
-        if (self.has_attached_file) {
-            self.addMessage(Message.userWithFile(self.input_slice, self.getAttachedFileName()));
-        } else {
+        // Add the user's message to the visible history, then durably log
+        // it. Logging reads `getAttachedFileName()` (backed by
+        // `attached_file_path`) before that field is cleared below.
+        const seq = if (self.has_attached_file)
+            self.addMessage(Message.userWithFile(self.input_slice, self.getAttachedFileName()))
+        else
             self.addMessage(Message.user(self.input_slice));
-        }
+
+        self.session_log.logUser(
+            main_mod.process_io,
+            seq,
+            self.input_slice,
+            if (self.has_attached_file) self.getAttachedFileName() else null,
+        );
 
         self.pending_file_path_len = attached_path_len;
 
@@ -660,11 +1045,20 @@ pub const AppState = struct {
         self.is_loading = true;
         self.error_message = null;
 
-        if (self.http_client == null) {
-            self.error_message = "No API key configured";
-            self.is_loading = false;
-            window.requestRender();
-            return;
+        const provider = self.selected_model.provider();
+        switch (provider) {
+            .anthropic => if (self.http_client == null) {
+                self.error_message = "No Anthropic API key configured";
+                self.is_loading = false;
+                window.requestRender();
+                return;
+            },
+            .openai => if (self.openai_client == null) {
+                self.error_message = "No OpenAI API key configured";
+                self.is_loading = false;
+                window.requestRender();
+                return;
+            },
         }
 
         // Launch the worker on the shared Io instance. `io.async` returns
@@ -682,12 +1076,20 @@ pub const AppState = struct {
         std.debug.assert(self.pending_request == null);
 
         const io = main_mod.process_io;
-        self.pending_request = io.async(httpWorker, .{
-            io,
-            &self.http_client.?,
-            self,
-            &self.result_queue,
-        });
+        self.pending_request = switch (provider) {
+            .anthropic => io.async(httpWorker, .{
+                io,
+                &self.http_client.?,
+                self,
+                &self.result_queue,
+            }),
+            .openai => io.async(openaiChatWorker, .{
+                io,
+                &self.openai_client.?,
+                self,
+                &self.result_queue,
+            }),
+        };
 
         window.requestRender();
     }
@@ -750,6 +1152,7 @@ pub const AppState = struct {
         // therefore the Stop button instead of the Send button).
         self.is_loading = false;
         self.streaming_message_idx = null;
+        self.streaming_message_seq = null;
         self.error_message = null;
 
         log.info("Streaming request cancelled by user", .{});
@@ -775,7 +1178,7 @@ pub const AppState = struct {
     /// result. Returning `error.Aborted` short-circuits the SSE read loop;
     /// we do that once the staging buffer is full so the worker doesn't
     /// keep parsing bytes it has nowhere to put.
-    fn onStreamDelta(userdata: *anyopaque, text: []const u8) http.StreamSink.Error!void {
+    fn onStreamDelta(userdata: *anyopaque, text: []const u8) anthropic.StreamSink.Error!void {
         const ctx: *StreamCtx = @ptrCast(@alignCast(userdata));
         const app = ctx.app;
 
@@ -819,6 +1222,196 @@ pub const AppState = struct {
         app.requestRenderFromWorker();
     }
 
+    // =========================================================================
+    // Compaction — runs on the worker fiber, ahead of the chat request
+    // =========================================================================
+
+    /// Size of the staged attachment, or 0 when none is staged or it can't
+    /// be measured. Best-effort on purpose: a stat failure means the
+    /// estimator under-counts and compaction fires a turn later than ideal,
+    /// which is strictly better than refusing to send.
+    fn stagedAttachmentBytes(io: std.Io, app: *Self) u64 {
+        if (app.pending_file_path_len == 0) return 0;
+        std.debug.assert(app.pending_file_path_len <= MAX_FILE_PATH_LEN);
+
+        const path = app.pending_file_path[0..app.pending_file_path_len];
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |e| {
+            log.debug("compaction: cannot stat '{s}' for the token estimate: {t}", .{ path, e });
+            return 0;
+        };
+        defer file.close(io);
+
+        const stat = file.stat(io) catch |e| {
+            log.debug("compaction: stat failed for '{s}': {t}", .{ path, e });
+            return 0;
+        };
+        return stat.size;
+    }
+
+    /// Fills `buf` with the slice of history `[from, to)` to be summarized,
+    /// followed by the instruction turn that asks for the summary.
+    ///
+    /// `from` is snapped to a `.user` turn by `retainedStart`, so the
+    /// request satisfies Anthropic's "first message must be user" rule by
+    /// construction. Any prior summary leads the transcript as its own user
+    /// turn so the new summary subsumes it instead of losing it —
+    /// `compaction.SYSTEM_INSTRUCTION` tells the model to expect that.
+    fn buildSummaryRequest(
+        self: *Self,
+        buf: *ChatMessagesBuffer,
+        view: CompactionView,
+        from: usize,
+        to: usize,
+    ) anthropic.ChatRequest {
+        std.debug.assert(from < to);
+        std.debug.assert(to <= self.message_count);
+
+        buf.count = 0;
+        if (view.summary.len > 0) {
+            // This can put two `.user` turns back to back (the prior
+            // summary, then the retained slice's own leading user turn),
+            // and likewise below where the instruction follows a user turn.
+            // The Messages API merges consecutive same-role turns, so the
+            // only rule that actually binds is "the first message is user"
+            // — which holds either way: `retainedStart` snapped `from` to a
+            // user turn, and the summary is one.
+            buf.messages[buf.count] = anthropic.ChatMessage.text(.user, view.summary);
+            buf.count += 1;
+        }
+
+        var i = from;
+        while (i < to and buf.count + 1 < MAX_MESSAGES) : (i += 1) {
+            const msg = self.getMessage(i) orelse break;
+            const role: anthropic.ChatRole = switch (msg.role) {
+                .user => .user,
+                .assistant => .assistant,
+                .system => continue,
+            };
+            buf.messages[buf.count] = anthropic.ChatMessage.text(role, msg.getText());
+            buf.count += 1;
+        }
+
+        buf.messages[buf.count] = anthropic.ChatMessage.text(.user, compaction.REQUEST);
+        buf.count += 1;
+        std.debug.assert(buf.count <= MAX_MESSAGES);
+
+        return .{
+            // Summarizing with the cheapest model is the industry norm and
+            // costs nothing structurally here: the model is per-request and
+            // `AnthropicClient` is model-agnostic.
+            .model = Model.haiku.apiName(),
+            .messages = buf.messages[0..buf.count],
+            .system = compaction.SYSTEM_INSTRUCTION,
+        };
+    }
+
+    /// Compacts if the estimated request has crossed
+    /// `compaction.TRIGGER_RATIO` of the model's window, and returns the
+    /// view the caller should build its request from.
+    ///
+    /// Every early return hands back the live view unchanged, which is the
+    /// whole point of making compaction derived: a skipped or failed
+    /// compaction costs one wasted summarization request at worst and the
+    /// send proceeds on whatever history is currently retained. If that
+    /// then 400s for length, it surfaces through `applyChatError` with no
+    /// new machinery.
+    fn runCompaction(
+        io: std.Io,
+        client: *anthropic.AnthropicClient,
+        app: *Self,
+        queue: *std.Io.Queue(WorkerResult),
+    ) CompactionView {
+        const live = app.liveCompactionView();
+
+        const window_tokens = app.selected_model.contextWindowTokens();
+        const estimate = app.estimatedTokens(live, stagedAttachmentBytes(io, app));
+        if (estimate < compaction.thresholdTokens(window_tokens)) return live;
+
+        const cut = app.planCompactionCut(live) orelse return live;
+        log.info(
+            "compaction: ~{d} tokens of a {d} window, summarizing messages {d}..{d}",
+            .{ estimate, window_tokens, cut.from, cut.to },
+        );
+
+        var buf: ChatMessagesBuffer = .{};
+        const request = app.buildSummaryRequest(&buf, live, cut.from, cut.to);
+
+        var result = client.sendBlocking(request);
+        defer result.deinit(client.allocator);
+
+        const text = result.getText() orelse {
+            log.warn("compaction: summarization failed ({s}), sending uncompacted", .{result.getError() orelse "unknown"});
+            return live;
+        };
+        const len = compaction.utf8SafeLen(text, MAX_SUMMARY_LEN);
+        if (len == 0) return live;
+        std.debug.assert(len <= MAX_SUMMARY_LEN);
+
+        @memcpy(app.pending_summary_buf[0..len], text[0..len]);
+        app.pending_summary_len = len;
+
+        // Publish so the main thread — which owns `summary_*` — adopts the
+        // cut. We keep using our own staged copy for this request either
+        // way; the queue item is what makes the next send inherit it.
+        queue.putOne(io, .{ .compaction_applied = .{
+            .summary_len = @intCast(len),
+            .covers = cut.covers,
+        } }) catch |e| {
+            log.debug("runCompaction: compaction result dropped ({t})", .{e});
+        };
+        app.requestRenderFromWorker();
+
+        return .{ .summary = app.pending_summary_buf[0..len], .covers = cut.covers };
+    }
+
+    /// Where a new compaction would cut, or null if it would not make
+    /// progress.
+    ///
+    /// Progress is the guard that keeps a long retained tail from
+    /// compacting on every single turn: once the newest
+    /// `compaction.KEEP_RECENT` messages are all that sit past the existing
+    /// cut, there is nothing left to summarize and re-running would just
+    /// burn a request per send while staying over threshold.
+    ///
+    /// The returned `covers` is the realized cut rather than the proposed
+    /// one. `retainedStart` snaps forward to a `.user` turn, so the
+    /// summarized range `[from, to)` routinely extends past the proposal;
+    /// storing the proposal would understate what the summary represents
+    /// and leave `covers` meaningful only after a second trip through
+    /// `retainedStart`. Converting the snapped index back into `seq` space
+    /// here performs the index-to-count conversion once, at the point of
+    /// decision, instead of implicitly at every call site that later reads
+    /// the cut.
+    fn planCompactionCut(self: *const Self, live: CompactionView) ?struct {
+        from: usize,
+        to: usize,
+        covers: u64,
+    } {
+        const proposed = compaction.proposedCovers(self.messages_total);
+        if (proposed <= live.covers) return null;
+
+        const from = self.retainedStart(live.covers);
+        const to = self.retainedStart(proposed);
+        if (to <= from) return null;
+
+        // `to` indexes the live ring, while the cut is stored against the
+        // monotonic counter, so shift it by however far the ring's index 0
+        // has drifted from `seq` 0 — the same `evicted` term `cutToIndex`
+        // subtracts on the way in.
+        const evicted = self.messages_total - @as(u64, @intCast(self.message_count));
+        const covers = evicted + @as(u64, @intCast(to));
+
+        std.debug.assert(to <= self.message_count);
+        std.debug.assert(covers > live.covers);
+        std.debug.assert(covers <= self.messages_total);
+        // The snap is already baked into `covers`, so re-resolving it must
+        // land on the same boundary rather than sliding forward again.
+        // This is the property that makes the stored cut mean what
+        // `CompactionResult.covers` claims it means.
+        std.debug.assert(self.retainedStart(covers) == to);
+        return .{ .from = from, .to = to, .covers = covers };
+    }
+
     /// Chat worker: builds the request, opens an SSE stream against
     /// Anthropic's Messages API, forwards each `text_delta` to the render
     /// thread via `onStreamDelta`, and finally signals stream completion
@@ -830,7 +1423,7 @@ pub const AppState = struct {
     /// callers, but this worker does not exercise it.
     fn httpWorker(
         io: std.Io,
-        client: *http.AnthropicClient,
+        client: *anthropic.AnthropicClient,
         app: *Self,
         queue: *std.Io.Queue(WorkerResult),
     ) void {
@@ -841,16 +1434,26 @@ pub const AppState = struct {
         // into the first delta.
         app.pending_response_len = 0;
 
+        // Compaction runs here, inline, as the worker's first step rather
+        // than as its own fiber. Because it never mutates UI state it needs
+        // no round trip to the main thread before the chat request can
+        // proceed — which is what keeps this single-flight: no
+        // `is_compacting` flag, no second entry point into "launch a
+        // worker," no re-entrancy. `is_loading` already means "a send is in
+        // flight," which is exactly true during this call, and
+        // `cancelInFlight` covers both phases unchanged.
+        const view = runCompaction(io, client, app, queue);
+
         var buf: ChatMessagesBuffer = .{};
-        const request = app.buildChatRequest(&buf);
+        const request = app.buildAnthropicChatRequest(&buf, view);
 
         var ctx = StreamCtx{ .io = io, .app = app, .queue = queue };
-        const sink = http.StreamSink{
+        const sink = anthropic.StreamSink{
             .userdata = @ptrCast(&ctx),
             .callback = onStreamDelta,
         };
 
-        var result: http.ChatResult = undefined;
+        var result: anthropic.ChatResult = undefined;
         if (app.pending_file_path_len > 0) {
             const file_path = app.pending_file_path[0..app.pending_file_path_len];
             log.info("Streaming message with file attachment: {s}", .{file_path});
@@ -877,6 +1480,77 @@ pub const AppState = struct {
             // Queue closed (teardown) or task cancelled: main thread is
             // tearing down, drop the result.
             log.debug("httpWorker: terminal result dropped ({t})", .{e});
+        };
+
+        app.requestRenderFromWorker();
+    }
+
+    /// SSE sink callback for OpenAI streaming chat — mirrors `onStreamDelta`
+    /// exactly, but bound to `openai.StreamSink.Error` (a distinct type from
+    /// `anthropic.StreamSink.Error`, so it needs its own function pointer
+    /// rather than sharing one across providers).
+    fn onOpenAIStreamDelta(userdata: *anyopaque, text: []const u8) openai.StreamSink.Error!void {
+        const ctx: *StreamCtx = @ptrCast(@alignCast(userdata));
+        const app = ctx.app;
+
+        const old_len = app.pending_response_len;
+        std.debug.assert(old_len <= MAX_RESPONSE_LEN);
+        const remaining = MAX_RESPONSE_LEN - old_len;
+
+        if (remaining == 0) return error.Aborted;
+
+        const to_copy = @min(text.len, remaining);
+        @memcpy(
+            app.pending_response_buf[old_len .. old_len + to_copy],
+            text[0..to_copy],
+        );
+        const new_len = old_len + to_copy;
+        app.pending_response_len = new_len;
+
+        const cumulative_len: u32 = @intCast(new_len);
+        ctx.queue.putOne(ctx.io, .{ .chat_delta = .{ .cumulative_len = cumulative_len } }) catch |e| {
+            log.debug("onOpenAIStreamDelta: queue closed ({t}), aborting", .{e});
+            return error.Aborted;
+        };
+
+        app.requestRenderFromWorker();
+    }
+
+    /// Chat worker for OpenAI models (see `Model.provider`) — mirrors
+    /// `httpWorker`'s shape exactly, but text-only: `sendMessage` refuses
+    /// to launch this path when a file is attached (see its doc comment),
+    /// so there is no attachment branch here.
+    fn openaiChatWorker(
+        io: std.Io,
+        client: *openai.OpenAIClient,
+        app: *Self,
+        queue: *std.Io.Queue(WorkerResult),
+    ) void {
+        app.pending_response_len = 0;
+
+        // No compaction pass: summarizing goes through haiku, which lives
+        // on the Anthropic client this worker doesn't have. A summary
+        // earned on the Anthropic path is still honored — see
+        // `buildOpenAIChatRequest`.
+        var buf: OpenAIChatMessagesBuffer = .{};
+        const request = app.buildOpenAIChatRequest(&buf, app.liveCompactionView());
+
+        var ctx = StreamCtx{ .io = io, .app = app, .queue = queue };
+        const sink = openai.StreamSink{
+            .userdata = @ptrCast(&ctx),
+            .callback = onOpenAIStreamDelta,
+        };
+
+        var result = client.sendStreamingChat(request, sink);
+        defer result.deinit(client.allocator);
+
+        const outcome: WorkerResult = switch (result.status) {
+            .success => .{ .chat_success = .{ .response_len = app.pending_response_len } },
+            .err => |msg| .{ .chat_error = .{ .message = msg } },
+        };
+
+        queue.putOne(io, outcome) catch |e| {
+            log.debug("openaiChatWorker: terminal result dropped ({t})", .{e});
         };
 
         app.requestRenderFromWorker();
@@ -953,6 +1627,7 @@ pub const AppState = struct {
                 .chat_delta => |d| self.applyChatDelta(d),
                 .chat_success => |ok| self.applyChatSuccess(ok),
                 .chat_error => |err| self.applyChatError(err),
+                .compaction_applied => |c| self.applyCompactionApplied(c),
                 .transcription_success => |ok| self.applyTranscriptionSuccess(ok, window),
                 .transcription_error => |err| self.applyTranscriptionError(err),
             }
@@ -975,9 +1650,10 @@ pub const AppState = struct {
         // — which can't happen during a single stream, but the
         // assertion below pins the invariant either way).
         if (self.streaming_message_idx == null) {
-            self.addMessage(Message.assistant(""));
+            const seq = self.addMessage(Message.assistant(""));
             std.debug.assert(self.message_count > 0);
             self.streaming_message_idx = @intCast(self.message_count - 1);
+            self.streaming_message_seq = seq;
         }
 
         const idx = self.streaming_message_idx.?;
@@ -1035,9 +1711,15 @@ pub const AppState = struct {
         self.awaitPendingRequest();
 
         // Streaming path: deltas already populated the assistant message.
-        // We only need to clear the "stream in flight" tracking.
-        if (self.streaming_message_idx != null) {
+        // Log the finalized text now (never per-delta — see
+        // `session_log.zig`), then clear the "stream in flight" tracking.
+        if (self.streaming_message_idx) |idx| {
+            const seq = self.streaming_message_seq.?;
+            const text = self.getMessage(idx).?.getText();
+            self.session_log.logAssistant(main_mod.process_io, seq, text);
+
             self.streaming_message_idx = null;
+            self.streaming_message_seq = null;
             self.error_message = null;
             self.is_loading = false;
             return;
@@ -1047,7 +1729,8 @@ pub const AppState = struct {
         // length response). Surface as a single empty assistant message
         // for visual consistency rather than silently dropping the turn.
         const response = self.pending_response_buf[0..r.response_len];
-        self.addMessage(Message.assistant(response));
+        const seq = self.addMessage(Message.assistant(response));
+        self.session_log.logAssistant(main_mod.process_io, seq, response);
         self.error_message = null;
         self.is_loading = false;
     }
@@ -1061,10 +1744,77 @@ pub const AppState = struct {
         // If the stream already produced visible output, leave the
         // partial assistant message in place — it's better UX than
         // wiping a half-typed paragraph. The error banner still tells
-        // the user something went wrong.
+        // the user something went wrong. Log that partial text too: the
+        // turn is final (it will never receive another delta), even
+        // though it's truncated.
+        if (self.streaming_message_idx) |idx| {
+            const seq = self.streaming_message_seq.?;
+            const text = self.getMessage(idx).?.getText();
+            self.session_log.logAssistant(main_mod.process_io, seq, text);
+        }
+
         self.streaming_message_idx = null;
+        self.streaming_message_seq = null;
         self.error_message = e.message;
         self.is_loading = false;
+    }
+
+    /// Adopt the summary the worker staged, advancing the cut every future
+    /// request assembles from. Nothing here touches `messages`: the ring
+    /// keeps every turn, so scrolling up still shows real history and the
+    /// virtual list's indices and cached heights are untouched.
+    ///
+    /// Also durably records the summary, so a restored session inherits the
+    /// cut instead of re-paying for summarization.
+    fn applyCompactionApplied(self: *Self, r: CompactionResult) void {
+        std.debug.assert(r.summary_len > 0);
+        std.debug.assert(r.summary_len <= MAX_SUMMARY_LEN);
+        std.debug.assert(r.covers > self.summary_covers); // Must make progress.
+        std.debug.assert(r.covers <= self.messages_total);
+
+        const len: usize = @intCast(r.summary_len);
+        std.debug.assert(len <= self.pending_summary_len);
+        @memcpy(self.summary_buf[0..len], self.pending_summary_buf[0..len]);
+        self.summary_len = len;
+        self.summary_covers = r.covers;
+
+        self.session_log.logSummary(
+            main_mod.process_io,
+            self.messages_total,
+            r.covers,
+            self.summary_buf[0..len],
+        );
+
+        log.info("compaction applied: {d} messages now summarized in {d} bytes", .{ r.covers, len });
+    }
+
+    /// Clears the derived compaction state. Called wherever the transcript
+    /// those `seq` numbers refer to is replaced — a stale `summary_covers`
+    /// against a different conversation would silently truncate the new
+    /// one's history.
+    fn clearCompaction(self: *Self) void {
+        self.summary_len = 0;
+        self.summary_covers = 0;
+        self.pending_summary_len = 0;
+        std.debug.assert(self.summary_len == 0);
+        std.debug.assert(self.summary_covers == 0);
+    }
+
+    /// Banner text for the composer — "History compacted · N earlier
+    /// messages summarized" — or null when nothing has been compacted.
+    ///
+    /// Formatted on demand into a state-owned buffer rather than kept in
+    /// sync with `summary_covers` at each write point, so there is no
+    /// second source of truth that can drift. Main thread only.
+    pub fn compactionBanner(self: *Self) ?[]const u8 {
+        if (self.summary_len == 0) return null;
+        std.debug.assert(self.summary_covers > 0);
+
+        return std.fmt.bufPrint(
+            &self.compaction_banner_buf,
+            "History compacted \xc2\xb7 {d} earlier messages summarized",
+            .{self.summary_covers},
+        ) catch null;
     }
 
     /// Await and clear the in-flight transcription `Future`. Same
@@ -1117,10 +1867,179 @@ pub const AppState = struct {
         window.requestRender();
     }
 
+    /// Toggles the settings view. Mutually exclusive with the history view
+    /// (`history_expanded`) — opening settings closes history, since both
+    /// take over the content area in place of `ContentArea`.
     pub fn toggleSettings(self: *Self, window: *gooey.Window) void {
         std.debug.assert(self.microphone.devices.count <= audio.MAX_INPUT_DEVICES);
         std.debug.assert(self.message_count <= MAX_MESSAGES);
         self.settings_expanded = !self.settings_expanded;
+        if (self.settings_expanded) self.history_expanded = false;
+        window.requestRender();
+    }
+
+    /// Toggles the history panel. Opening it re-scans `sessions/*.jsonl`
+    /// (see `refreshSessionHistory`) so the list reflects any sessions
+    /// written since it was last opened; closing it leaves the last scan in
+    /// place rather than clearing it, since re-opening will just rescan.
+    /// Mutually exclusive with the settings view — see `toggleSettings`.
+    pub fn toggleHistory(self: *Self, window: *gooey.Window) void {
+        std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
+        self.history_expanded = !self.history_expanded;
+        if (self.history_expanded) self.settings_expanded = false;
+        if (self.history_expanded) self.refreshSessionHistory();
+        if (self.history_expanded) {
+            std.debug.assert(self.history_list_state.item_count == @as(u32, @intCast(self.session_entry_count)));
+        }
+        window.requestRender();
+    }
+
+    /// Scans `sessions/*.jsonl` (via `session_log.listSessions`) into
+    /// `session_entries`, newest first, and syncs `history_list_state` so
+    /// the panel's uniform list has the right item count.
+    fn refreshSessionHistory(self: *Self) void {
+        std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
+
+        const io = main_mod.process_io;
+        self.session_entry_count = session_log_mod.listSessions(std.Io.Dir.cwd(), io, &self.session_entries);
+        std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
+
+        self.history_list_state.setItemCount(@intCast(self.session_entry_count));
+        self.history_list_state.scrollToTop();
+    }
+
+    /// Bounded-checked accessor for `session_entries`, mirroring `getMessage`.
+    pub fn getSessionEntry(self: *const Self, i: usize) ?session_log_mod.SessionEntry {
+        if (i >= self.session_entry_count) return null;
+        std.debug.assert(i < session_log_mod.MAX_SESSION_ENTRIES);
+        return self.session_entries[i];
+    }
+
+    /// Restores `session_entries[index]`'s conversation into the live
+    /// ring, replacing whatever is currently loaded — the "Restore"
+    /// mechanism sketched in `docs/CHAT_COMPACTION.md`. Cancels any
+    /// in-flight request first (a stale `streaming_message_idx` into a
+    /// just-cleared ring would be unsound), then reads the session's own
+    /// JSONL file — not the current `SessionLog`, which keeps writing to
+    /// this process's own file unaffected: any turns sent after a restore
+    /// extend it, continuing from the restored `messages_total`.
+    pub fn loadSession(self: *Self, window: *gooey.Window, index: u32) void {
+        std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
+        const entry = self.getSessionEntry(index) orelse return;
+        std.debug.assert(entry.unix_seconds > 0);
+
+        self.cancelInFlight(window);
+        self.clearMessages();
+        self.clearCompaction();
+
+        const RestoreCtx = struct {
+            app: *Self,
+            max_seq_seen: u64 = 0,
+
+            fn onLine(ctx: *@This(), line: session_log_mod.LoadedLine) void {
+                switch (line) {
+                    .message => |m| ctx.onMessage(m),
+                    .summary => |s| ctx.onSummary(s),
+                }
+            }
+
+            fn onMessage(ctx: *@This(), m: session_log_mod.LoadedMessage) void {
+                const msg = switch (m.role) {
+                    .user => if (m.attached_file) |file_name|
+                        Message.userWithFile(m.text, file_name)
+                    else
+                        Message.user(m.text),
+                    .assistant => Message.assistant(m.text),
+                };
+                _ = ctx.app.addMessage(msg);
+                if (m.seq >= ctx.max_seq_seen) ctx.max_seq_seen = m.seq + 1;
+            }
+
+            /// Adopt the last summary the session recorded. Later summaries
+            /// subsume earlier ones (each is computed from the previous
+            /// one — see `buildSummaryRequest`), so plain assignment in
+            /// file order lands on the right cut.
+            fn onSummary(ctx: *@This(), s: session_log_mod.LoadedSummary) void {
+                const len = @min(s.text.len, MAX_SUMMARY_LEN);
+                if (len == 0) return;
+                // A summary that covers nothing is not a summary. Only a
+                // truncated or hand-edited file can produce one, but
+                // adopting it would leave `summary_len > 0` alongside
+                // `summary_covers == 0` — a state the guard below cannot
+                // see and `compactionBanner` asserts against on the very
+                // next frame.
+                if (s.covers == 0) return;
+                @memcpy(ctx.app.summary_buf[0..len], s.text[0..len]);
+                ctx.app.summary_len = len;
+                ctx.app.summary_covers = s.covers;
+                if (s.seq >= ctx.max_seq_seen) ctx.max_seq_seen = s.seq;
+            }
+        };
+
+        var ctx = RestoreCtx{ .app = self };
+        session_log_mod.loadSessionLines(
+            std.Io.Dir.cwd(),
+            main_mod.process_io,
+            std.heap.page_allocator,
+            entry.unix_seconds,
+            &ctx,
+            RestoreCtx.onLine,
+        );
+
+        // `messages_total` must land at least at the restored high-water
+        // mark so a turn sent after this point gets a `seq` the on-disk
+        // log has never used — even though the ring only kept the newest
+        // `MAX_MESSAGES` of a longer session.
+        if (ctx.max_seq_seen > self.messages_total) self.messages_total = ctx.max_seq_seen;
+
+        // The restored `summary_covers` is a `seq` from *that file's*
+        // numbering, while `messages_total` keeps counting in this
+        // process's. The two coincide when restoring into a session that
+        // hasn't sent anything yet — the common case, and the one where the
+        // cut lands exactly right. Otherwise this process is already `base`
+        // messages ahead, so `cutToIndex` resolves the cut `base` messages
+        // too early and a few turns get sent verbatim that the summary
+        // already covers. Redundant, never lossy, and it costs a handful of
+        // messages rather than the machinery to translate seq spaces.
+        //
+        // A cut past the end of the transcript, though, would clamp real
+        // history away, so drop the summary outright. Only reachable via a
+        // truncated or hand-edited file.
+        if (self.summary_covers > self.messages_total) self.clearCompaction();
+        if (self.summary_len == 0) std.debug.assert(self.summary_covers == 0);
+
+        self.invalidateCachedHeights();
+        self.history_expanded = false;
+        window.requestRender();
+    }
+
+    /// Starts a brand new conversation: cancels any in-flight request,
+    /// clears the live message ring, and rotates `session_log` onto a new
+    /// on-disk file (`SessionLog.startNew`) so this conversation's turns
+    /// don't mix into whatever file this process had been writing to.
+    /// `messages_total` resets to 0 too — unlike `loadSession`'s restore,
+    /// there is no prior transcript whose `seq` numbers need protecting
+    /// from reuse, since the old file is left untouched on disk under its
+    /// own name. Also closes the history panel, so the freshly emptied
+    /// `ContentArea` is what greets the user next.
+    ///
+    /// Not currently wired to any UI control — `HistoryPanel` dropped its
+    /// "New chat" button once `HistoryToggle` started doubling as a "back
+    /// to chat" affordance. Kept for a future call site (e.g. a keyboard
+    /// shortcut) rather than deleted outright.
+    pub fn newConversation(self: *Self, window: *gooey.Window) void {
+        std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
+
+        self.cancelInFlight(window);
+        self.clearMessages();
+
+        self.session_log.startNew(main_mod.process_io);
+        self.messages_total = 0;
+        self.clearCompaction();
+
+        self.invalidateCachedHeights();
+        self.history_expanded = false;
+        std.debug.assert(self.message_count == 0);
         window.requestRender();
     }
 
