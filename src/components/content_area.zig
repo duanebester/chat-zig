@@ -4,11 +4,11 @@ const std = @import("std");
 const gooey = @import("gooey");
 const Cx = gooey.Cx;
 const ui = gooey.ui;
-const Lucide = @import("gooey-components").Lucide;
+const components = @import("gooey-components");
+const Lucide = components.Lucide;
 
 const state_mod = @import("../state.zig");
 const theme_mod = @import("../theme.zig");
-const limits_mod = @import("../limits.zig");
 const constants = @import("constants.zig");
 const icon = @import("icon.zig").icon;
 const MessageRow = @import("message.zig").MessageRow;
@@ -33,6 +33,7 @@ pub const ContentArea = struct {
         const t = theme_mod.get(s.dark_mode);
 
         if (s.message_count == 0) {
+            s.message_list_id = null;
             cx.render(ui.box(.{ .style = .{
                 .width = .{ .grow = 1 },
                 .height = .{ .grow = 1 },
@@ -56,20 +57,14 @@ pub const ContentArea = struct {
             return;
         }
 
-        const first = transcriptStart(s);
+        // The whole conversation, built only where it is in view and kept
+        // at its newest message while the reader is there: a streamed reply
+        // scrolls into view as it grows, and scrolling up releases it.
         cx.render(ui.box(.{
-            .key = .{ .name = "message-list" },
-            .style = .{
-                .width = .{ .grow = 1 },
-                .height = .{ .grow = 1 },
-                .padding = .{ .top = 8, .bottom = 16, .left = CONTENT_PADDING, .right = CONTENT_PADDING },
-                .gap = 24,
-                .scroll = .{},
-            },
+            .style = .{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 } },
             .a11y = .{ .role = .list, .label = "Conversation" },
         }, .{
-            if (first > 0) EarlierNote{ .count = first, .color = t.text_muted } else null,
-            Transcript{ .first = first, .count = @intCast(s.message_count) },
+            TranscriptList{ .count = @intCast(s.message_count) },
         }));
 
         // Between `sendMessage` and the first streaming delta there is no
@@ -92,49 +87,28 @@ pub const ContentArea = struct {
     }
 };
 
-/// Index of the oldest message the list draws. Gooey emits every glyph in a
-/// scroll box each frame, so the list draws the newest messages that fit in
-/// `transcript_bytes_frame_max`, and always the newest one. Older turns are
-/// still in history and still sent; only drawing stops.
-fn transcriptStart(s: *const AppState) u32 {
-    std.debug.assert(s.message_count > 0);
-    var first: usize = s.message_count - 1;
-    var bytes: usize = s.getMessage(first).?.content_len;
-    std.debug.assert(bytes <= limits_mod.transcript_bytes_frame_max);
-    while (first > 0) {
-        const len = s.getMessage(first - 1).?.content_len;
-        if (bytes + len > limits_mod.transcript_bytes_frame_max) break;
-        bytes += len;
-        first -= 1;
-    }
-    return @intCast(first);
-}
-
-const Transcript = struct {
-    first: u32,
+/// The transcript `List`, built inside the box that labels it for screen
+/// readers, so it records the list's id there for `sendMessage`.
+const TranscriptList = struct {
     count: u32,
 
-    pub fn render(self: Transcript, cx: *Cx) void {
-        std.debug.assert(self.first < self.count);
+    pub fn render(self: TranscriptList, cx: *Cx) void {
+        std.debug.assert(self.count > 0);
         std.debug.assert(self.count <= state_mod.MAX_MESSAGES);
-        var index = self.first;
-        while (index < self.count) : (index += 1) {
-            cx.render(MessageRow{ .index = index });
-        }
-    }
-};
-
-const EarlierNote = struct {
-    count: u32,
-    color: gooey.Color,
-
-    pub fn render(self: EarlierNote, cx: *Cx) void {
-        var buffer: [64]u8 = undefined;
-        const label = std.fmt.bufPrint(&buffer, "{d} earlier messages not shown", .{self.count}) catch
-            unreachable; // 64 bytes holds the template and any u32.
-        cx.render(ui.box(.{ .style = .{ .width = .{ .grow = 1 }, .alignment = .center } }, .{
-            ui.text(label, .{ .color = .{ .rgba = self.color }, .size = 12 }),
-        }));
+        const key = "message-list";
+        cx.state(AppState).message_list_id = cx.id(.{ .name = key });
+        cx.render(components.List(MessageRow){
+            .key = key,
+            .count = self.count,
+            .gap = 24,
+            .anchor = .end,
+            .style = .{ .padding = .{
+                .top = 8,
+                .bottom = 16,
+                .left = CONTENT_PADDING,
+                .right = CONTENT_PADDING,
+            } },
+        });
     }
 };
 

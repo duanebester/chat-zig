@@ -9,11 +9,9 @@
 //!
 //! Run with: zig build run
 //!
-//! Gooey 0.5 owns the entry point: `gooey.App(State, render, config)` creates
-//! the state, runs `on_init`, and drives the event loop. It does not hand the
-//! process's `std.Io` or environment to app code, so `main` publishes both on
-//! module globals before calling `App.main`. `AppState` uses them for the
-//! API keys, the HTTP workers, and the session log.
+//! Gooey owns the entry point: `gooey.App(State, render, config)` creates the
+//! state, runs `on_init` with the process's io and environment, drives the
+//! event loop, and runs the requests in `jobs` on workers it owns.
 
 const std = @import("std");
 const gooey = @import("gooey");
@@ -22,18 +20,9 @@ const state_mod = @import("state.zig");
 const layout = @import("layout.zig");
 const theme = @import("theme.zig");
 const limits_mod = @import("limits.zig");
+const jobs = @import("jobs.zig");
 
 pub const AppState = state_mod.AppState;
-
-// =============================================================================
-// Process-global handles populated from `std.process.Init`
-// =============================================================================
-//
-// Assigned exactly once, before `App.main` runs `on_init`, and read-only for
-// the rest of the process lifetime.
-
-pub var process_env: std.process.Environ = .empty;
-pub var process_io: std.Io = undefined;
 
 pub const App = gooey.App(AppState, layout.render, .{
     .title = "ChatAI",
@@ -47,11 +36,11 @@ pub const App = gooey.App(AppState, layout.render, .{
         .{ .keys = "cmd-q", .action = gooey.ui.action(layout.Quit) },
         .{ .keys = "ctrl-q", .action = gooey.ui.action(layout.Quit) },
     },
+    .jobs = &.{ jobs.ChatJob, jobs.TranscribeJob },
     .on_init = AppState.init,
+    .on_deinit = AppState.deinit,
 });
 
 pub fn main(init: std.process.Init) !void {
-    process_env = init.minimal.environ;
-    process_io = init.io;
     return App.main(init);
 }

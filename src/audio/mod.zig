@@ -38,7 +38,7 @@ pub fn listInputDevices() InputDeviceList {
 /// `RECORDING_MAX_CHANNELS`. Only one recording at a time — returns
 /// `error.AlreadyRecording` otherwise.
 ///
-/// `io` is the process `std.Io` (`main.process_io`), so WAV file creation
+/// `io` is the process `std.Io` (`gooey.Init.io`), so WAV file creation
 /// stays on the same IO plumbing as the rest of the app.
 pub fn startRecording(io: std.Io, device: InputDevice, output_path: []const u8) RecorderError!void {
     std.debug.assert(output_path.len > 0);

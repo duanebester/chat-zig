@@ -15,8 +15,6 @@ const Cx = gooey.Cx;
 const ui = gooey.ui;
 const Color = gooey.Color;
 
-const main_mod = @import("../main.zig");
-
 /// Scale and opacity at the bottom of the breath. Neither bottoms out at
 /// zero — a dot that fully vanishes reads as a flicker rather than a pulse.
 const SCALE_MIN: f32 = 0.6;
@@ -37,10 +35,7 @@ pub const PulseDot = struct {
         std.debug.assert(self.size > 0.0);
         std.debug.assert(self.period_ms > 0);
 
-        const now_ms: u64 = @intCast(@divFloor(
-            std.Io.Timestamp.now(main_mod.process_io, .awake).toNanoseconds(),
-            std.time.ns_per_ms,
-        ));
+        const now_ms: u64 = @divFloor(cx.now(), std.time.ns_per_ms);
         const phase = @as(f32, @floatFromInt(now_ms % self.period_ms)) /
             @as(f32, @floatFromInt(self.period_ms));
         cx.requestRenderAfter(FRAME_MS);
