@@ -24,7 +24,7 @@ Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version
 - 🧹 Automatic chat compaction — long conversations are summarized so requests stay bounded (see [`docs/CHAT_COMPACTION.md`](docs/CHAT_COMPACTION.md))
 - 💾 Session persistence — conversations are logged to `sessions/*.jsonl` and browsable/restorable from a history panel
 - 🎨 Light/dark theme
-- 📜 Streaming replies into a scrolling transcript, bounded to the newest 40 KiB of text per frame
+- 📜 Streaming replies into a scrolling transcript of any length that follows the newest message
 - 🔄 Async HTTP requests on `std.Io.concurrent` workers + `std.Io.Queue` (non-blocking UI, zero heap per result), with retry/backoff shared across providers
 - ✂️ Stop button cancels the in-flight request
 - ⌨️ Text input (with IME) and send button, file attachments, and a live microphone level meter while recording
@@ -114,21 +114,13 @@ When no worker is running the app requests no frames and sits idle.
 
 ### Resource budget
 
-Gooey 0.5 reserves every pool at startup from one `gooey.ResourceLimits` value and
-panics, naming the field, if a frame needs more. ChatZig uses `.small` with these
-overrides (`src/limits.zig`):
-
-| Field | `.small` | ChatZig | Why |
-| --- | ---: | ---: | --- |
-| `paint.glyph_count_frame_max` | 4,096 | 49,152 | The transcript draws up to 40 KiB of message text per frame, plus chrome |
-| `records.paint_record_count_frame_max` | 8,192 | 65,536 | One paint record per glyph, beside quads and icons |
-| `build.text_bytes_frame_max` | 64 KiB | 64 KiB | Asserted to cover the 40 KiB transcript plus 8 KiB of chrome |
-| `text.glyph_cache_count_max` | 1,024 | 4,096 | Replies in other scripts draw many distinct glyphs |
-| `text.shaped_run_count_max` | 128 | 512 | Keeps the visible transcript's shaped runs cached between frames |
-
-Gooey emits every glyph inside a scroll box each frame, so the transcript draws the
-newest messages that fit in 40 KiB (always the newest one, which is at most 32 KiB)
-and notes how many earlier ones it skipped. Those are still in history and still sent.
+Gooey reserves every pool at startup from one `gooey.ResourceLimits` value and
+panics, naming the field, if a frame needs more. ChatZig uses `.small` unchanged
+(`src/limits.zig`). The transcript is a `List` whose rows measure their text with
+`cx.measureText`, so it builds only the messages in view, and Gooey draws only the
+glyphs a scroll box shows: a frame's cost follows the window, not the conversation.
+The list is anchored at its end, so a streamed reply stays in view while you are at
+the bottom; scrolling up releases it, and sending a message jumps back down.
 
 ### Compaction and session persistence
 

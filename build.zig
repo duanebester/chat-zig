@@ -179,17 +179,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_date_format_tests = b.addRunArtifact(date_format_tests);
 
-    // How message text is cut into runs Gooey can shape; std-only too.
-    const text_chunk_tests = b.addTest(.{
-        .name = "text-chunk-tests",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/text_chunk.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_text_chunk_tests = b.addRunArtifact(text_chunk_tests);
-
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_openai_tests.step);
@@ -197,5 +186,4 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_session_log_tests.step);
     test_step.dependOn(&run_compaction_tests.step);
     test_step.dependOn(&run_date_format_tests.step);
-    test_step.dependOn(&run_text_chunk_tests.step);
 }

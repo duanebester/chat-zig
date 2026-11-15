@@ -394,6 +394,9 @@ pub const AppState = struct {
     // UI State
     // =========================================================================
     is_loading: bool = false,
+    /// The transcript `List`'s id, which `ContentArea` records as it builds
+    /// the list, for `sendMessage` to scroll; null while no list is shown.
+    message_list_id: ?gooey.ElementId = null,
     has_api_key: bool = false,
     has_openai_api_key: bool = false,
     is_transcribing: bool = false,
@@ -614,6 +617,10 @@ pub const AppState = struct {
             self.addMessage(Message.userWithFile(self.input_slice, self.getAttachedFileName()))
         else
             self.addMessage(Message.user(self.input_slice));
+        // Sending jumps to the new message from wherever the reader was; the
+        // list's end anchor then keeps the streamed reply in view.
+        if (self.message_list_id) |list| effects.scrollTo(list, .end);
+
         self.session_log.logUser(
             self.io,
             seq,
