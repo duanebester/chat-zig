@@ -184,7 +184,9 @@ fn gooeyTheme(comptime t: Theme) gooey.Theme {
         .bg = t.bg.withAlpha(1),
         // TextArea's fill and the Select trigger: the composer card's fill,
         // so the input sits in the card without a second visible plate.
-        .surface = t.input_area_bg,
+        // Opaque: `Select` paints its menu on a popover layer in `surface`,
+        // and a translucent menu shows the controls beneath it.
+        .surface = t.input_area_bg.withAlpha(1),
         // Hovered Select trigger and options.
         .overlay = t.border,
         .primary = t.primary,
