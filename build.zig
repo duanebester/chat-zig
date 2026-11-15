@@ -12,15 +12,32 @@ pub fn build(b: *std.Build) void {
         "linux-backend",
         "Linux display/renderer: wayland_vulkan (default), wayland_cpu, or fbdev",
     ) orelse .wayland_vulkan;
+    // Gooey's frame trace passes through, for timing a scroll of a long
+    // transcript: `-Dframe-trace=scroll` writes frame-trace.csv and quits.
+    const frame_trace = b.option(
+        enum { off, passive, redraw, scroll, typing },
+        "frame-trace",
+        "Record per-frame phase times to frame-trace.csv: off (default), passive, " ++
+            "redraw, scroll, or typing",
+    ) orelse .off;
+    const frame_trace_seconds = b.option(
+        u32,
+        "frame-trace-seconds",
+        "Seconds a frame trace runs before it writes its file and quits (default 30)",
+    ) orelse 30;
     const gooey_dep = if (target.result.os.tag == .linux) b.dependency("gooey", .{
         .target = target,
         .optimize = optimize,
         .@"linux-backend" = linux_backend,
         // Gooey ships compiled SPIR-V; its GLSL is only rebuilt in its own repo.
         .@"skip-shader-compile" = true,
+        .@"frame-trace" = frame_trace,
+        .@"frame-trace-seconds" = frame_trace_seconds,
     }) else b.dependency("gooey", .{
         .target = target,
         .optimize = optimize,
+        .@"frame-trace" = frame_trace,
+        .@"frame-trace-seconds" = frame_trace_seconds,
     });
     const gooey_mod = gooey_dep.module("gooey");
     const gooey_components_mod = gooey_dep.module("gooey-components");
