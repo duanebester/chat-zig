@@ -1,8 +1,15 @@
-//! macOS audio input device enumeration and recording.
+//! Audio input device enumeration and recording.
+//!
+//! Capture is macOS-only (CoreAudio/AudioToolbox). Elsewhere the app builds
+//! and runs with no input devices: the device list is empty, so the record
+//! button stays disabled, and starting a recording reports `BackendError`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const devices = @import("devices.zig");
 const recorder = @import("recorder.zig");
+
+const has_capture = builtin.os.tag == .macos;
 
 pub const InputDevice = devices.InputDevice;
 pub const InputDeviceList = devices.InputDeviceList;
@@ -16,6 +23,7 @@ pub const WAVEFORM_BAR_COUNT = recorder.WAVEFORM_BAR_COUNT;
 /// Enumerate the system's audio input (microphone) devices.
 /// Synchronous and allocation-free.
 pub fn listInputDevices() InputDeviceList {
+    if (!has_capture) return .{};
     const result = devices.listInputDevices();
 
     std.debug.assert(result.count <= MAX_INPUT_DEVICES);
@@ -30,12 +38,13 @@ pub fn listInputDevices() InputDeviceList {
 /// `RECORDING_MAX_CHANNELS`. Only one recording at a time — returns
 /// `error.AlreadyRecording` otherwise.
 ///
-/// `io` should be the caller's Gooey IO handle (e.g. `cx.io()` / `w.io`)
-/// so WAV file creation stays on the same IO plumbing as the rest of the app.
+/// `io` is the process `std.Io` (`main.process_io`), so WAV file creation
+/// stays on the same IO plumbing as the rest of the app.
 pub fn startRecording(io: std.Io, device: InputDevice, output_path: []const u8) RecorderError!void {
     std.debug.assert(output_path.len > 0);
     std.debug.assert(device.channel_count > 0);
 
+    if (!has_capture) return error.BackendError;
     return recorder.start(io, device, output_path);
 }
 
@@ -43,6 +52,7 @@ pub fn startRecording(io: std.Io, device: InputDevice, output_path: []const u8) 
 /// sample count, and closes the file. `error.NotRecording` if nothing
 /// was recording.
 pub fn stopRecording() RecorderError!void {
+    if (!has_capture) return error.NotRecording;
     return recorder.stop();
 }
 
@@ -50,6 +60,7 @@ pub fn stopRecording() RecorderError!void {
 /// `WAVEFORM_BAR_COUNT` amplitude levels, oldest first, each in `[0, 1]`.
 /// Safe to call every frame, recording or not.
 pub fn waveformLevels() [WAVEFORM_BAR_COUNT]f32 {
+    if (!has_capture) return @splat(0);
     const result = recorder.waveformLevels();
 
     std.debug.assert(result.len == WAVEFORM_BAR_COUNT);

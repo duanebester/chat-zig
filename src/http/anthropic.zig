@@ -529,8 +529,8 @@ const UploadAttemptCtx = struct {
 
     pub fn requestRejected(c: @This(), status: http.Status) FileUploadResult {
         std.debug.assert(c.api_key.len > 0);
-        std.debug.assert(@intFromEnum(status) >= 400);
-        log.err("Files API HTTP {d}", .{@intFromEnum(status)});
+        std.debug.assert(@backingInt(status) >= 400);
+        log.err("Files API HTTP {d}", .{@backingInt(status)});
         return FileUploadResult.err("Files API returned error");
     }
 
@@ -1019,9 +1019,9 @@ pub const AnthropicClient = struct {
 
         pub fn requestRejected(c: @This(), status: http.Status) ChatResult {
             std.debug.assert(c.self.api_key.len > 0);
-            std.debug.assert(@intFromEnum(status) >= 400);
+            std.debug.assert(@backingInt(status) >= 400);
 
-            const status_code: u32 = @intFromEnum(status);
+            const status_code: u32 = @backingInt(status);
             log.err("Anthropic API HTTP {d}", .{status_code});
             const message: []const u8 = switch (status_code) {
                 400 => "Bad request",
@@ -1706,9 +1706,9 @@ test "classifyHttpStatus retry-worthy codes" {
     // Anthropic-specific: 429 (rate_limit_error), 529 (overloaded_error).
     // 408 is also retried — it's almost always a transient client/server
     // desync rather than a stable rejection.
-    try std.testing.expect(classifyHttpStatus(@enumFromInt(408)) == error.Transient);
-    try std.testing.expect(classifyHttpStatus(@enumFromInt(429)) == error.Transient);
-    try std.testing.expect(classifyHttpStatus(@enumFromInt(529)) == error.Transient);
+    try std.testing.expect(classifyHttpStatus(@fromBackingInt(@intCast(408))) == error.Transient);
+    try std.testing.expect(classifyHttpStatus(@fromBackingInt(@intCast(429))) == error.Transient);
+    try std.testing.expect(classifyHttpStatus(@fromBackingInt(@intCast(529))) == error.Transient);
 
     // 5xx server errors: server is recovering, retrying typically helps.
     try std.testing.expect(classifyHttpStatus(.internal_server_error) == error.Transient);

@@ -170,12 +170,47 @@ pub fn get(is_dark_mode: bool) Theme {
 }
 
 // =============================================================================
-// Glass Background Colors (for window configuration)
+// Gooey Themes
 // =============================================================================
+//
+// Gooey 0.4 components (`TextArea`, `Select`) no longer take per-instance
+// colours: they resolve theme tokens. These map ChatZig's palette onto
+// `gooey.Theme` so the stock components match the hand-built ones, and the
+// theme toggle swaps them with `Effects.setTheme`. The window clears to
+// `bg`, which is opaque because 0.4.0 cut the glass window effect.
 
-pub const glass_light = Color.rgba(0.96, 0.96, 0.97, 1.0);
-pub const glass_dark = Color.rgba(0.12, 0.12, 0.14, 1.0);
+fn gooeyTheme(comptime t: Theme) gooey.Theme {
+    return .{
+        .bg = t.bg.withAlpha(1),
+        // TextArea's fill and the Select trigger: the composer card's fill,
+        // so the input sits in the card without a second visible plate.
+        .surface = t.input_area_bg,
+        // Hovered Select trigger and options.
+        .overlay = t.border,
+        .primary = t.primary,
+        // Toolbar and composer icons (`components/icon.zig` paints with
+        // tokens, so the palette's icon colour needs a token of its own).
+        .secondary = t.icon_muted,
+        // The attachment chip's icon.
+        .accent = t.file_chip_icon,
+        .success = t.success,
+        .warning = t.danger,
+        .danger = t.danger,
+        .text = t.text,
+        .subtext = t.text_secondary,
+        // Placeholders and the TextArea scrollbar.
+        .muted = t.text_placeholder,
+        .border = t.border_input,
+        .border_focus = focus_ring,
+    };
+}
 
-pub fn getGlassColor(is_dark_mode: bool) Color {
-    return if (is_dark_mode) glass_dark else glass_light;
+/// The blue focus outline Gooey 0.2.9's TextArea drew on both themes.
+const focus_ring = Color.rgb(0.29, 0.47, 0.96);
+
+pub const gooey_dark: gooey.Theme = gooeyTheme(dark);
+pub const gooey_light: gooey.Theme = gooeyTheme(light);
+
+pub fn gooeyFor(is_dark_mode: bool) *const gooey.Theme {
+    return if (is_dark_mode) &gooey_dark else &gooey_light;
 }

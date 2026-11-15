@@ -21,71 +21,53 @@ const AppState = state_mod.AppState;
 
 const CONTENT_PADDING = constants.CONTENT_PADDING;
 const SETTINGS_ROW_GAP: f32 = 10.0;
-const SETTINGS_CARD_CORNER_RADIUS = 10;
+const SETTINGS_CARD_CORNER_RADIUS: f32 = 10;
 const SETTINGS_CARD_PADDING: f32 = 16.0;
 
 pub const SettingsPanel = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
 
-        cx.render(ui.box(.{
-            .fill_width = true,
-            .padding = .{ .each = .{ .top = 4, .bottom = 12, .left = CONTENT_PADDING, .right = CONTENT_PADDING } },
-        }, .{
-            ui.text("Settings", .{ .color = t.text, .size = 16, .weight = .medium }),
+        cx.render(ui.box(.{ .style = .{
+            .width = .{ .grow = 1 },
+            .padding = .{ .top = 4, .bottom = 12, .left = CONTENT_PADDING, .right = CONTENT_PADDING },
+        } }, .{
+            ui.text("Settings", .{ .color = .text, .size = 16, .weight = .medium }),
         }));
 
-        cx.render(ui.box(.{
-            .fill_width = true,
-            .direction = .column,
+        cx.render(ui.box(.{ .style = .{
+            .width = .{ .grow = 1 },
             .gap = SETTINGS_ROW_GAP,
-            .padding = .{ .each = .{ .top = 0, .bottom = 16, .left = CONTENT_PADDING, .right = CONTENT_PADDING } },
-        }, .{
-            ui.box(.{
-                .fill_width = true,
-                .direction = .column,
-                .gap = 8,
-                .padding = .{ .all = SETTINGS_CARD_PADDING },
-                .background = t.card,
-                .border_color = t.border,
-                .border_width = .{ .all = 1 },
-                .corner_radius = SETTINGS_CARD_CORNER_RADIUS,
-            }, .{
-                ui.text("Chat model", .{ .color = t.text_secondary, .size = 12, .weight = .medium }),
-                ModelSelector{},
-            }),
+            .padding = .{ .bottom = 16, .left = CONTENT_PADDING, .right = CONTENT_PADDING },
+        } }, .{
+            Card(ModelSelector){ .title = "Chat model" },
             // The dictation model card only renders when an OpenAI key is
             // configured (`DictationModelSelector`'s own rationale), so the
             // page doesn't show a picker with nothing to pick from.
-            ui.when(s.has_openai_api_key, .{
-                ui.box(.{
-                    .fill_width = true,
-                    .direction = .column,
-                    .gap = 8,
-                    .padding = .{ .all = SETTINGS_CARD_PADDING },
-                    .background = t.card,
-                    .border_color = t.border,
-                    .border_width = .{ .all = 1 },
-                    .corner_radius = SETTINGS_CARD_CORNER_RADIUS,
-                }, .{
-                    ui.text("Dictation model", .{ .color = t.text_secondary, .size = 12, .weight = .medium }),
-                    DictationModelSelector{},
-                }),
-            }),
-            ui.box(.{
-                .fill_width = true,
-                .direction = .column,
-                .gap = 8,
-                .padding = .{ .all = SETTINGS_CARD_PADDING },
-                .background = t.card,
-                .border_color = t.border,
-                .border_width = .{ .all = 1 },
-                .corner_radius = SETTINGS_CARD_CORNER_RADIUS,
-            }, .{
-                ui.text("Microphone", .{ .color = t.text_secondary, .size = 12, .weight = .medium }),
-                MicrophoneSettings{},
-            }),
+            if (s.has_openai_api_key) Card(DictationModelSelector){ .title = "Dictation model" } else null,
+            Card(MicrophoneSettings){ .title = "Microphone" },
         }));
     }
 };
+
+/// A titled settings card around one control.
+fn Card(comptime Control: type) type {
+    return struct {
+        title: []const u8,
+
+        pub fn render(self: @This(), cx: *Cx) void {
+            const t = theme_mod.get(cx.state(AppState).dark_mode);
+            cx.render(ui.box(.{ .style = .{
+                .width = .{ .grow = 1 },
+                .gap = 8,
+                .padding = .all(SETTINGS_CARD_PADDING),
+                .background = .{ .rgba = t.card },
+                .border = .{ .width = 1, .color = .{ .rgba = t.border } },
+                .corner_radius = .all(SETTINGS_CARD_CORNER_RADIUS),
+            } }, .{
+                ui.text(self.title, .{ .color = .subtext, .size = 12, .weight = .medium }),
+                Control{},
+            }));
+        }
+    };
+}

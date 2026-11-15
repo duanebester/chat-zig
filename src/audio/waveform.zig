@@ -35,8 +35,7 @@ const VISUAL_GAIN: f32 = 4.0;
 
 pub const WaveformHistory = struct {
     /// Oldest at index 0, newest at `WAVEFORM_BAR_COUNT - 1`.
-    levels: [WAVEFORM_BAR_COUNT]std.atomic.Value(f32) =
-        [_]std.atomic.Value(f32){std.atomic.Value(f32).init(0)} ** WAVEFORM_BAR_COUNT,
+    levels: [WAVEFORM_BAR_COUNT]std.atomic.Value(f32) = @splat(.init(0)),
 
     /// Called from `inputCallback` with a raw interleaved 16-bit PCM
     /// chunk: computes its amplitude, maps it to a `[0, 1]` visual
@@ -126,7 +125,7 @@ fn amplitudeToVisualLevel(normalized_rms: f32) f32 {
 // =============================================================================
 
 test "rms16 of silence is zero" {
-    const silence = [_]u8{0} ** 16;
+    const silence: [16]u8 = @splat(0);
     try std.testing.expectEqual(@as(f32, 0.0), rms16(&silence));
 }
 

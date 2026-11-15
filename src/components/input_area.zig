@@ -1,21 +1,27 @@
 //! Bottom composer card: error banner, text area, attachment chip, and actions.
 
+const std = @import("std");
 const gooey = @import("gooey");
 const Cx = gooey.Cx;
 const ui = gooey.ui;
-const Color = gooey.Color;
-const Svg = gooey.components.Svg;
-const Lucide = gooey.components.Lucide;
-const TextArea = gooey.components.TextArea;
+const components = @import("gooey-components");
+const Lucide = components.Lucide;
+const TextArea = components.TextArea;
 
 const state_mod = @import("../state.zig");
 const theme_mod = @import("../theme.zig");
 const constants = @import("constants.zig");
+const icon = @import("icon.zig").icon;
 const ComposerActions = @import("composer_actions.zig").ComposerActions;
+const WidthProbe = @import("width_probe.zig").WidthProbe;
 
 const AppState = state_mod.AppState;
 
 const INPUT_CARD_CORNER_RADIUS = constants.INPUT_CARD_CORNER_RADIUS;
+/// The text row's horizontal padding inside the card.
+const TEXT_ROW_PADDING_X: f32 = 16;
+/// Narrowest the input gets, whatever the probe reports.
+const TEXT_AREA_WIDTH_MIN: f32 = 120;
 
 pub const InputArea = struct {
     pub fn render(_: @This(), cx: *Cx) void {
@@ -28,100 +34,136 @@ pub const InputArea = struct {
         // older part is being *sent* in condensed form.
         const compaction_banner = s.compactionBanner();
 
+        // `TextArea` takes a fixed width and render cannot read the window's,
+        // so a zero-height probe below the input measures the row each frame
+        // (`WidthProbe`) and the next build uses it. When the width just
+        // changed (a resize), build once more so the input catches up even
+        // if nothing else renders.
+        if (s.composer_width != s.composer_width_used) cx.requestRenderAfter(16);
+        s.composer_width_used = s.composer_width;
+        s.composer_probe = .{ .width = &s.composer_width };
+        const text_area_width = @max(TEXT_AREA_WIDTH_MIN, s.composer_width_used);
+
+        // Both boxes are keyed so the `TextArea`'s id stays put. An unkeyed
+        // box's id comes from its position among its siblings, and the
+        // banners above the card and the thinking dot above the composer
+        // come and go; a moved id would retain a new text engine and drop
+        // the old one's text, focus, and pool slot.
         cx.render(ui.box(.{
-            .fill_width = true,
-            .direction = .column,
-            .gap = 12,
+            .key = .{ .name = "composer" },
+            .style = .{ .width = .{ .grow = 1 }, .gap = 12 },
         }, .{
-            ui.when(compaction_banner != null, .{
-                ui.box(.{
-                    .fill_width = true,
-                    .padding = .{ .symmetric = .{ .x = 12, .y = 8 } },
-                    .direction = .row,
-                    .gap = 8,
-                    .alignment = .{ .main = .start, .cross = .center },
-                    .background = t.text_secondary.withAlpha(0.08),
-                    .corner_radius = 10,
-                }, .{
-                    Svg{ .path = Lucide.archive, .size = 14, .no_fill = true, .stroke_color = t.text_secondary, .stroke_width = 1.5 },
-                    ui.text(compaction_banner orelse "", .{
-                        .color = t.text_secondary,
-                        .size = 12,
-                    }),
-                }),
-            }),
-            // Error message (if any)
-            ui.when(s.error_message != null, .{
-                ui.box(.{
-                    .fill_width = true,
-                    .padding = .{ .all = 12 },
-                    .background = t.danger.withAlpha(0.08),
-                    .corner_radius = 10,
-                }, .{
-                    ui.text(s.error_message orelse "", .{
-                        .color = t.danger,
-                        .size = 13,
-                    }),
-                }),
-            }),
+            if (compaction_banner) |text| CompactionBanner{ .text = text } else null,
+            if (s.error_message) |text| ErrorBanner{ .text = text } else null,
             ui.box(.{
-                .fill_width = true,
-                .background = t.input_area_bg,
-                .border_color = t.border_input,
-                .border_width = .{ .all = 1 },
-                .corner_radius = INPUT_CARD_CORNER_RADIUS,
-                .direction = .column,
+                .key = .{ .name = "composer-card" },
+                .style = .{
+                    .width = .{ .grow = 1 },
+                    .background = .{ .rgba = t.input_area_bg },
+                    .border = .{ .width = 1, .color = .{ .rgba = t.border_input } },
+                    .corner_radius = .all(INPUT_CARD_CORNER_RADIUS),
+                },
             }, .{
-                // Text input area - full width
-                ui.box(.{
-                    .fill_width = true,
-                    .padding = .{ .symmetric = .{ .x = 16, .y = 8 } },
-                }, .{
+                ui.box(.{ .style = .{
+                    .width = .{ .grow = 1 },
+                    .padding = .{ .top = 16, .left = TEXT_ROW_PADDING_X, .right = TEXT_ROW_PADDING_X },
+                } }, .{
                     TextArea{
-                        .id = "chat-input",
-                        .placeholder = if (s.is_transcribing) "Transcribing..." else if (s.has_api_key) "Ask me anything" else "API key required",
+                        .key = "chat-input",
+                        .placeholder = if (s.is_transcribing)
+                            "Transcribing..."
+                        else if (s.has_api_key)
+                            "Ask me anything"
+                        else
+                            "API key required",
                         .bind = &s.input_slice,
                         .rows = 2,
-                        .background = Color.transparent,
-                        .border_color = Color.transparent,
-                        .text_color = t.text,
-                        .placeholder_color = t.text_placeholder,
-                        .fill_width = true,
+                        .width = text_area_width,
                     },
-                }),
-                ui.when(s.has_attached_file, .{
-                    ui.box(.{
-                        .padding = .{ .symmetric = .{ .x = 16, .y = 4 } },
-                        .direction = .row,
-                        .alignment = .{ .main = .start, .cross = .center },
-                    }, .{
-                        ui.box(.{
-                            .padding = .{ .each = .{ .top = 6, .right = 6, .bottom = 6, .left = 10 } },
-                            .direction = .row,
-                            .gap = 8,
-                            .alignment = .{ .main = .start, .cross = .center },
-                            .background = t.primary.withAlpha(0.1),
-                            .corner_radius = 8,
-                        }, .{
-                            Svg{ .path = Lucide.paperclip, .size = 14, .no_fill = true, .stroke_color = t.primary, .stroke_width = 1.5 },
-                            ui.text(s.getAttachedFileName(), .{
-                                .color = t.primary,
-                                .size = 13,
-                            }),
-                            ui.box(.{
-                                .width = 20,
-                                .height = 20,
-                                .corner_radius = 10,
-                                .alignment = .{ .main = .center, .cross = .center },
-                                .cursor = .pointer,
-                                .on_click_handler = cx.command(AppState.clearAttachedFile),
-                            }, .{
-                                Svg{ .path = Lucide.x, .size = 12, .no_fill = true, .stroke_color = t.text_secondary, .stroke_width = 1.5 },
-                            }),
-                        }),
+                    ui.paint(WidthProbe, &s.composer_probe, WidthProbe.paint, .{
+                        .width = .{ .grow = 1 },
+                        .height = .{ .fixed = 0 },
                     }),
                 }),
+                if (s.has_attached_file) AttachedFile{ .name = s.getAttachedFileName() } else null,
                 ComposerActions{},
+            }),
+        }));
+    }
+};
+
+const CompactionBanner = struct {
+    text: []const u8,
+
+    pub fn render(self: CompactionBanner, cx: *Cx) void {
+        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        cx.render(ui.box(.{ .style = .{
+            .direction = .row,
+            .width = .{ .grow = 1 },
+            .padding = .symmetric(12, 8),
+            .gap = 8,
+            .alignment = .center_cross,
+            .background = .{ .rgba = t.text_secondary.withAlpha(0.08) },
+            .corner_radius = .all(10),
+        } }, .{
+            icon(.{ .path = Lucide.archive, .size = 14, .stroke = .subtext }),
+            ui.text(self.text, .{ .color = .subtext, .size = 12 }),
+        }));
+    }
+};
+
+const ErrorBanner = struct {
+    text: []const u8,
+
+    pub fn render(self: ErrorBanner, cx: *Cx) void {
+        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        cx.render(ui.box(.{
+            .style = .{
+                .width = .{ .grow = 1 },
+                .padding = .all(12),
+                .background = .{ .rgba = t.danger.withAlpha(0.08) },
+                .corner_radius = .all(10),
+            },
+            .a11y = .{ .role = .alert, .label = self.text, .live = .assertive },
+        }, .{
+            ui.text(self.text, .{ .color = .danger, .size = 13, .wrap = .words }),
+        }));
+    }
+};
+
+const AttachedFile = struct {
+    name: []const u8,
+
+    pub fn render(self: AttachedFile, cx: *Cx) void {
+        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        cx.render(ui.box(.{ .style = .{
+            .direction = .row,
+            .padding = .symmetric(16, 4),
+            .alignment = .center_cross,
+        } }, .{
+            ui.box(.{ .style = .{
+                .direction = .row,
+                .padding = .{ .top = 6, .right = 6, .bottom = 6, .left = 10 },
+                .gap = 8,
+                .alignment = .center_cross,
+                .background = .{ .rgba = t.primary.withAlpha(0.1) },
+                .corner_radius = .all(8),
+            } }, .{
+                icon(.{ .path = Lucide.paperclip, .size = 14, .stroke = .primary }),
+                ui.text(self.name, .{ .color = .primary, .size = 13 }),
+                ui.box(.{
+                    .style = .{
+                        .width = .{ .fixed = 20 },
+                        .height = .{ .fixed = 20 },
+                        .corner_radius = .all(10),
+                        .alignment = .center,
+                        .cursor = .pointer,
+                    },
+                    .on_click = cx.on(AppState.clearAttachedFile, .{}),
+                    .a11y = .{ .role = .button, .label = "Remove attachment" },
+                }, .{
+                    icon(.{ .path = Lucide.x, .size = 12, .stroke = .subtext }),
+                }),
             }),
         }));
     }

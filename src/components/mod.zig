@@ -12,6 +12,7 @@ pub const ComposerActions = @import("composer_actions.zig").ComposerActions;
 pub const ContentArea = @import("content_area.zig").ContentArea;
 pub const DictationModelSelector = @import("dictation_model_selector.zig").DictationModelSelector;
 pub const HistoryPanel = @import("history_panel.zig").HistoryPanel;
+pub const Icon = @import("icon.zig");
 pub const HistoryToggle = @import("history_toggle.zig").HistoryToggle;
 pub const InputArea = @import("input_area.zig").InputArea;
 pub const message = @import("message.zig");

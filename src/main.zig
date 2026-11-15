@@ -1,31 +1,27 @@
 //! ChatAI - AI Chat Application
 //!
-//! A beautiful chat application built with Gooey that connects to Anthropic's API.
-//! Features a modern glass UI design.
+//! A chat client built with Gooey that talks to Anthropic's and OpenAI's APIs.
 //!
 //! Prerequisites:
 //!   Set ANTHROPIC_API_KEY environment variable
-//!   Optionally set OPENAI_API_KEY to enable voice recording ->
+//!   Optionally set OPENAI_API_KEY to enable GPT models and voice recording ->
 //!   text transcription (gpt-4o-mini-transcribe)
 //!
 //! Run with: zig build run
 //!
-//! Zig 0.16 notes:
-//!   - `main` receives `std.process.Init`, which provides `io`, `gpa`, `arena`,
-//!     and environment variables. We stash a reference on a process-global
-//!     so later-constructed components (`AppState.init`, the HTTP client) can
-//!     reach them without threading an extra parameter through every call.
-//!   - The `Io` instance is forwarded into gooey's `App` config so that the
-//!     framework, our HTTP client, and any future `io.async` work all share
-//!     the same threaded IO.
+//! Gooey 0.5 owns the entry point: `gooey.App(State, render, config)` creates
+//! the state, runs `on_init`, and drives the event loop. It does not hand the
+//! process's `std.Io` or environment to app code, so `main` publishes both on
+//! module globals before calling `App.main`. `AppState` uses them for the
+//! API keys, the HTTP workers, and the session log.
 
 const std = @import("std");
 const gooey = @import("gooey");
-const platform = gooey.platform;
 
 const state_mod = @import("state.zig");
 const layout = @import("layout.zig");
-const thinking_shader = @import("thinking_shader.zig");
+const theme = @import("theme.zig");
+const limits_mod = @import("limits.zig");
 
 pub const AppState = state_mod.AppState;
 
@@ -33,64 +29,29 @@ pub const AppState = state_mod.AppState;
 // Process-global handles populated from `std.process.Init`
 // =============================================================================
 //
-// Gooey's `App.main()` does not forward `init` into user code — render and
-// lifecycle callbacks only receive a `*Cx`. Rather than fork the framework to
-// thread `init` everywhere, we publish the handles we actually need on these
-// module-level variables. `AppState.init` pulls the env/IO from here.
-//
-// These are assigned exactly once, before `App.main()` is called, and then
-// treated as read-only for the rest of the process lifetime.
+// Assigned exactly once, before `App.main` runs `on_init`, and read-only for
+// the rest of the process lifetime.
 
 pub var process_env: std.process.Environ = .empty;
 pub var process_io: std.Io = undefined;
 
-var state = AppState{};
-
-/// Handle global keyboard shortcuts
-fn onEvent(cx: *gooey.Cx, event: gooey.input.InputEvent) bool {
-    switch (event) {
-        .key_down => |k| {
-            // Cmd+Q to quit
-            if (k.key == .q and k.modifiers.cmd) {
-                cx.quit();
-                return true;
-            }
-        },
-        else => {},
-    }
-    return false;
-}
-
-const App = gooey.App(AppState, &state, layout.render, .{
+pub const App = gooey.App(AppState, layout.render, .{
     .title = "ChatAI",
     .width = 500,
     .height = 700,
-    // Dark background for glass effect (app starts in dark mode)
-    .background_color = gooey.Color.rgba(0.14, 0.14, 0.16, 0.7),
-    // Semi-transparent background
-    .background_opacity = 0.7,
-    // Enable glass effect
-    .glass_style = .blur,
-    .glass_corner_radius = 12.0,
-    // Transparent titlebar for seamless look
-    .titlebar_transparent = true,
-    .full_size_content = true,
-    // Lifecycle
-    .init = AppState.init,
-    // Handle global keyboard shortcuts
-    .on_event = onEvent,
-    // Full-frame rim glow while the assistant is thinking. Gated at runtime
-    // by `thinking_shader.drive` — see that file for the accent-alpha trick.
-    .custom_shaders = &.{.{ .msl = thinking_shader.msl }},
+    .limits = limits_mod.limits,
+    // The app starts in dark mode (`AppState.dark_mode`).
+    .theme = &theme.gooey_dark,
+    // Ctrl+Q for Linux and Windows; macOS also gets Cmd+Q from its app menu.
+    .keymap = &.{
+        .{ .keys = "cmd-q", .action = gooey.ui.action(layout.Quit) },
+        .{ .keys = "ctrl-q", .action = gooey.ui.action(layout.Quit) },
+    },
+    .on_init = AppState.init,
 });
 
 pub fn main(init: std.process.Init) !void {
-    if (platform.is_wasm) unreachable;
-
-    // Publish env + io so `AppState.init` can consume them once gooey calls
-    // it with only a `*Cx`. Written once, before `App.main()` spins up.
     process_env = init.minimal.environ;
     process_io = init.io;
-
     return App.main(init);
 }

@@ -4,11 +4,26 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const gooey_dep = b.dependency("gooey", .{
+    // Gooey's Linux options pass through: `-Dlinux-backend=wayland_cpu` for
+    // machines without a Vulkan driver. Gooey declares them only for Linux
+    // targets, so other targets must not pass them.
+    const linux_backend = b.option(
+        enum { wayland_vulkan, wayland_cpu, fbdev },
+        "linux-backend",
+        "Linux display/renderer: wayland_vulkan (default), wayland_cpu, or fbdev",
+    ) orelse .wayland_vulkan;
+    const gooey_dep = if (target.result.os.tag == .linux) b.dependency("gooey", .{
+        .target = target,
+        .optimize = optimize,
+        .@"linux-backend" = linux_backend,
+        // Gooey ships compiled SPIR-V; its GLSL is only rebuilt in its own repo.
+        .@"skip-shader-compile" = true,
+    }) else b.dependency("gooey", .{
         .target = target,
         .optimize = optimize,
     });
     const gooey_mod = gooey_dep.module("gooey");
+    const gooey_components_mod = gooey_dep.module("gooey-components");
 
     // =========================================================================
     // Executable
@@ -20,13 +35,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "gooey", .module = gooey_mod },
+            .{ .name = "gooey-components", .module = gooey_components_mod },
         },
     });
 
-    // Gooey's module links macOS frameworks (AppKit, Metal, CoreText, etc.)
-    // transitively — no manual linkFramework ceremony needed here.
-    // Security is consumer-specific: std.http needs it for TLS on macOS.
-    // Zig 0.16 moved linkFramework off Compile steps; link it on the module.
+    // Gooey's module carries its own platform links (AppKit, Metal, CoreText
+    // on macOS; Wayland, Vulkan, FreeType and friends on Linux). Security is
+    // consumer-specific: std.http needs it for TLS on macOS. The audio
+    // frameworks back `src/audio`, which records on macOS only.
     if (target.result.os.tag == .macos) {
         exe_mod.linkFramework("Security", .{});
         exe_mod.linkFramework("CoreAudio", .{});
@@ -43,7 +59,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run ChatZig");
     run_step.dependOn(&run_cmd.step);
@@ -98,22 +114,22 @@ pub fn build(b: *std.Build) void {
     });
     const run_openai_tests = b.addRunArtifact(openai_tests);
 
-    const audio_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/audio/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    if (target.result.os.tag == .macos) {
+    // Capture is CoreAudio-only, so its tests run on macOS only.
+    const run_audio_tests: ?*std.Build.Step.Run = if (target.result.os.tag == .macos) blk: {
+        const audio_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/audio/mod.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         audio_test_mod.linkFramework("CoreAudio", .{});
         audio_test_mod.linkFramework("CoreFoundation", .{});
         audio_test_mod.linkFramework("AudioToolbox", .{});
-    }
-
-    const audio_tests = b.addTest(.{
-        .name = "audio-tests",
-        .root_module = audio_test_mod,
-    });
-    const run_audio_tests = b.addRunArtifact(audio_tests);
+        const audio_tests = b.addTest(.{
+            .name = "audio-tests",
+            .root_module = audio_test_mod,
+        });
+        break :blk b.addRunArtifact(audio_tests);
+    } else null;
 
     // `session_log.zig` imports `http/anthropic.zig` (to reuse
     // `writeJsonEscapedString`), so it needs the same Security link as
@@ -163,11 +179,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_date_format_tests = b.addRunArtifact(date_format_tests);
 
+    // How message text is cut into runs Gooey can shape; std-only too.
+    const text_chunk_tests = b.addTest(.{
+        .name = "text-chunk-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/text_chunk.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_text_chunk_tests = b.addRunArtifact(text_chunk_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_openai_tests.step);
-    test_step.dependOn(&run_audio_tests.step);
+    if (run_audio_tests) |run| test_step.dependOn(&run.step);
     test_step.dependOn(&run_session_log_tests.step);
     test_step.dependOn(&run_compaction_tests.step);
     test_step.dependOn(&run_date_format_tests.step);
+    test_step.dependOn(&run_text_chunk_tests.step);
 }

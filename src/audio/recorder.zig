@@ -119,25 +119,25 @@ const Lifecycle = struct {
     backend_failures: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     fn claim(self: *Lifecycle) bool {
-        std.debug.assert(@intFromEnum(BackendFailure.stop) != 0);
-        std.debug.assert(@intFromEnum(BackendFailure.dispose) != 0);
+        std.debug.assert(@backingInt(BackendFailure.stop) != 0);
+        std.debug.assert(@backingInt(BackendFailure.dispose) != 0);
         return self.claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
     }
 
     fn release(self: *Lifecycle) void {
         std.debug.assert(self.claimed.load(.acquire));
-        std.debug.assert(@intFromEnum(BackendFailure.enqueue) != 0);
+        std.debug.assert(@backingInt(BackendFailure.enqueue) != 0);
         self.claimed.store(false, .release);
     }
 
     fn resetFailures(self: *Lifecycle) void {
         std.debug.assert(self.claimed.load(.acquire));
-        std.debug.assert(@intFromEnum(BackendFailure.stop) != @intFromEnum(BackendFailure.dispose));
+        std.debug.assert(@backingInt(BackendFailure.stop) != @backingInt(BackendFailure.dispose));
         self.backend_failures.store(0, .release);
     }
 
     fn recordFailure(self: *Lifecycle, failure: BackendFailure) void {
-        const failure_bit = @intFromEnum(failure);
+        const failure_bit = @backingInt(failure);
         std.debug.assert(failure_bit != 0);
         std.debug.assert(failure_bit & (failure_bit - 1) == 0);
         _ = self.backend_failures.fetchOr(failure_bit, .acq_rel);
@@ -146,7 +146,7 @@ const Lifecycle = struct {
     fn backendResult(self: *const Lifecycle) RecorderError!void {
         const failures = self.backend_failures.load(.acquire);
         std.debug.assert(failures & ~@as(u8, 0b111) == 0);
-        std.debug.assert(@intFromEnum(BackendFailure.enqueue) == 0b100);
+        std.debug.assert(@backingInt(BackendFailure.enqueue) == 0b100);
         if (failures != 0) return error.BackendError;
     }
 };
