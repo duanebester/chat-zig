@@ -134,8 +134,8 @@ pub const ChatRequest = struct {
 ///
 /// The `text` slice is borrowed from the SSE reader's internal buffer and
 /// is only valid for the duration of the call. Callbacks must copy the
-/// bytes they want to keep (typically into a staging buffer behind a
-/// happens-before edge such as `Io.Queue.putOne`).
+/// bytes they want to keep (chat-zig's `jobs.Stream` copies them into a
+/// posted job result).
 ///
 /// `userdata` is the opaque pointer the caller passed alongside `callback`
 /// — the SSE loop never inspects it. Callbacks that don't need state can

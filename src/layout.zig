@@ -46,13 +46,6 @@ fn quit(_: *AppState, effects: *Effects) void {
 pub fn render(cx: *Cx) void {
     const s = cx.state(AppState);
 
-    // Apply completed worker results BEFORE anything reads `is_loading` or
-    // `messages`, so no frame shows a half-updated conversation. Gooey has
-    // no way for a worker to wake the event loop, so while one runs, keep
-    // asking for frames and poll its queue in each.
-    s.drainResults();
-    if (s.workerInFlight()) cx.requestRenderAfter(state_mod.WORKER_POLL_MS);
-
     cx.render(ui.box(.{
         .style = .{
             .width = .{ .grow = 1 },

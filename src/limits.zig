@@ -15,6 +15,7 @@ const std = @import("std");
 const gooey = @import("gooey");
 
 const state = @import("state.zig");
+const jobs = @import("jobs.zig");
 
 /// Message text bytes the transcript draws per frame: the newest messages
 /// whose total fits, and always the newest one. One codepoint draws at most
@@ -40,6 +41,9 @@ pub const limits: gooey.ResourceLimits = blk: {
     // Shaped runs kept between frames (128): the transcript is reshaped every
     // frame it does not fit, so keep the visible runs cached (`large`'s value).
     value.text.shaped_run_count_max = 512;
+    // A job result carries up to `jobs.text_bytes_max` (4 KiB) of text: a
+    // streamed piece, an error, or a transcript (2 KiB).
+    value.events.job_result_bytes_max = 8 * 1024;
     break :blk value;
 };
 
@@ -48,4 +52,6 @@ comptime {
     std.debug.assert(transcript_bytes_frame_max + chrome_glyph_count_frame_max <=
         limits.build.text_bytes_frame_max);
     std.debug.assert(state.MAX_INPUT_LEN <= limits.text.area.bytes_max);
+    std.debug.assert(@sizeOf(jobs.ChatJob.Result) <= limits.events.job_result_bytes_max);
+    std.debug.assert(@sizeOf(jobs.TranscribeJob.Result) <= limits.events.job_result_bytes_max);
 }
