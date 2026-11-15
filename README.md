@@ -5,9 +5,9 @@ to both Anthropic's Claude and OpenAI's GPT models.
 
 Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version).
 
-> **Status:** Zig 0.17 / Gooey v0.5.5. Runs on macOS and on Linux (Wayland).
-> HTTP runs on `std.Io.concurrent` workers that report back through a
-> `std.Io.Queue(T)`; files and session logs use `std.Io.Dir` / `std.Io.File`;
+> **Status:** Zig 0.17 / Gooey v0.6.0. Runs on macOS and on Linux (Wayland).
+> HTTP runs as Gooey background jobs (`effects.spawn`) that post results back to the
+> main thread; files and session logs use `std.Io.Dir` / `std.Io.File`;
 > both the Anthropic and OpenAI paths use the `io`-aware `std.http.Client`.
 
 <table>
@@ -25,20 +25,20 @@ Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version
 - 💾 Session persistence — conversations are logged to `sessions/*.jsonl` and browsable/restorable from a history panel
 - 🎨 Light/dark theme
 - 📜 Streaming replies into a scrolling transcript of any length that follows the newest message
-- 🔄 Async HTTP requests on `std.Io.concurrent` workers + `std.Io.Queue` (non-blocking UI, zero heap per result), with retry/backoff shared across providers
+- 🔄 Async HTTP requests as Gooey background jobs (non-blocking UI, no polling, zero heap per result), with retry/backoff shared across providers
 - ✂️ Stop button cancels the in-flight request
 - ⌨️ Text input (with IME) and send button, file attachments, and a live microphone level meter while recording
 
 ## Prerequisites
 
-1. **Zig 0.17.0** or newer — Install from [ziglang.org](https://ziglang.org/download/). Gooey 0.5 requires it (`minimum_zig_version`).
+1. **Zig 0.17.0** or newer — Install from [ziglang.org](https://ziglang.org/download/). Gooey 0.6 requires it (`minimum_zig_version`).
 2. **Anthropic API Key** — Get one from [Anthropic Console](https://console.anthropic.com/). Required for Claude models.
 3. **OpenAI API Key** (optional) — Get one from [OpenAI Platform](https://platform.openai.com/). Enables GPT chat models and voice dictation transcription; the app runs fine without it, just with those features disabled.
 
-Gooey is pinned to [v0.5.5](https://github.com/duanebester/gooey/releases/tag/v0.5.5) in `build.zig.zon`. To move to another release:
+Gooey is pinned to [v0.6.0](https://github.com/duanebester/gooey/releases/tag/v0.6.0) in `build.zig.zon`. To move to another release:
 
 ```bash
-zig fetch --save git+https://github.com/duanebester/gooey#v0.5.5
+zig fetch --save git+https://github.com/duanebester/gooey#v0.6.0
 ```
 
 **macOS** 14 or newer. **Linux** needs a Wayland compositor and Gooey's system libraries
@@ -77,40 +77,26 @@ zig build test
 
 ChatZig follows Gooey's app shape: one state struct, a render function, and handlers.
 
-1. **`main(init: std.process.Init)`** — publishes `init.io` and the environment on
-   module globals (Gooey hands neither to app code), then calls the generated
-   `App.main`. `gooey.App(AppState, layout.render, .{ ... })` owns the state and
-   declares the resource budget (`src/limits.zig`).
+1. **`main.zig`** declares the app: `gooey.App(AppState, layout.render, .{ ... })` owns
+   the state, declares the resource budget (`src/limits.zig`) and lists the background
+   jobs (`.jobs = &.{ ChatJob, TranscribeJob }`).
 2. **AppState** — single source of truth, initialized in place by Gooey and finished in
-   `on_init` (API keys, HTTP clients, the result queue). Its handlers are plain methods
-   bound with `cx.on(AppState.sendMessage, .{})`; the ones that need the framework take
-   `*gooey.Effects` (file dialog, theme switch, quit).
-3. **`layout.zig` + `src/components/`** — render UI from the current state. `layout.render`
-   first calls `s.drainResults()` to apply finished worker output.
-4. **Workers** — `sendMessage` starts the Anthropic or OpenAI worker with
-   `io.concurrent`, which guarantees it runs beside the UI thread (`io.async` may run it
-   inline). Both clients share the retry/backoff policy in `src/http/http.zig`.
+   `on_init`, which receives `gooey.Init` (`io`, `environ`) and creates the HTTP clients.
+   Its handlers are plain methods bound with `cx.on(AppState.sendMessage, .{})`; the ones
+   that need the framework take `*gooey.Effects` (spawn a job, scroll, file dialog, quit).
+3. **`layout.zig` + `src/components/`** — render UI from the current state.
+4. **Jobs** (`src/jobs.zig`) — the Anthropic or OpenAI request and voice transcription
+   run as Gooey background jobs. Both clients share the retry/backoff policy in
+   `src/http/http.zig`.
 
 ### Async result flow
 
-Gooey runs every handler on the main thread and has no public API for background work
-or for waking the event loop from another thread. So the workers use `std.Io` directly,
-and the UI polls while one is running:
-
-```zig
-// sendMessage: the Future lets the Stop button cancel exactly this request.
-self.pending_request = io.concurrent(httpWorker, .{ io, &self.http_client.?, self, &self.result_queue }) catch ...;
-
-// httpWorker, off the main thread: stage bytes, then publish a high-water mark.
-// `putOne` is the happens-before edge that makes the staged bytes visible.
-queue.putOne(io, .{ .chat_delta = .{ .cumulative_len = new_len } }) catch ...;
-
-// layout.render, on the main thread, every frame while a worker is in flight:
-s.drainResults(); // non-blocking `result_queue.get(io, &buf, 0)`
-if (s.workerInFlight()) cx.requestRenderAfter(state.WORKER_POLL_MS); // ~30 Hz
-```
-
-When no worker is running the app requests no frames and sits idle.
+`sendMessage` copies the conversation into `jobs.exchange`, an app-owned buffer, and
+starts a `ChatJob` with `effects.spawn`. The job runs on a worker Gooey owns and never
+touches `AppState`; each streamed piece it posts arrives at `AppState.onChatResult` on
+the main thread in the next drain, and each post wakes the event loop, so nothing polls.
+The Stop button calls `effects.cancelJob`, and at quit Gooey cancels and joins every job
+before `on_deinit`. When no job runs the app requests no frames and sits idle.
 
 ### Resource budget
 
