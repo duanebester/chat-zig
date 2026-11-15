@@ -36,8 +36,23 @@ pub const KEEP_RECENT: u64 = 8;
 
 /// ~1k tokens. Deliberately far below `state.MAX_MESSAGE_LEN`: a summary
 /// allowed to be 32 KB is not a summary. `REQUEST` asks for under 400 words
-/// and the response is truncated to fit.
+/// and the response is truncated to fit. Applies to the client-side
+/// summary only; a native block cannot be truncated (see below).
 pub const MAX_SUMMARY_LEN: usize = 4096;
+
+/// Caps for Anthropic's native `compaction` block. The API writes its own
+/// summary, typically 1–10 KB of text, and the block must be sent back
+/// byte-for-byte (its `signature` covers `content`), so nothing here may be
+/// truncated: a block that does not fit is refused and the client-side
+/// summary runs instead. Measured live: an 11k-token conversation gave
+/// 8.9 KB of content and a 1.6 KB signature, with no `encrypted_content`.
+pub const MAX_NATIVE_SUMMARY_LEN: usize = 32 * 1024;
+pub const MAX_SIGNATURE_LEN: usize = 8 * 1024;
+pub const MAX_ENCRYPTED_CONTENT_LEN: usize = 32 * 1024;
+
+comptime {
+    std.debug.assert(MAX_SUMMARY_LEN <= MAX_NATIVE_SUMMARY_LEN);
+}
 
 /// Bytes per token for the heuristic estimator. English prose runs close to
 /// 4. Being wrong by 30% moves the trigger from 75% to 65% or 85% of the
@@ -137,8 +152,173 @@ pub fn utf8SafeLen(text: []const u8, max: usize) usize {
 }
 
 // =============================================================================
+// Summary storage
+// =============================================================================
+
+/// The summary standing in for every message before the cut: either text
+/// chat-zig asked a model to write (client-side), or Anthropic's native
+/// `compaction` block, which is the same readable text plus a `signature`
+/// (and sometimes `encrypted_content`) that must travel back with it.
+///
+/// One type for both because the text is useful either way: a request to a
+/// model without native compaction, or to OpenAI, carries the block's text
+/// in the system prompt exactly as it would a client-side summary.
+///
+/// Fixed buffers, copied by length (`copyFrom`), never by value: three of
+/// these exist (live state, the job's snapshot, the job's staging slot).
+pub const Summary = struct {
+    text_buf: [MAX_NATIVE_SUMMARY_LEN]u8 = undefined,
+    text_len: u32 = 0,
+    signature_buf: [MAX_SIGNATURE_LEN]u8 = undefined,
+    signature_len: u32 = 0,
+    encrypted_buf: [MAX_ENCRYPTED_CONTENT_LEN]u8 = undefined,
+    encrypted_len: u32 = 0,
+
+    const Self = @This();
+
+    pub fn text(self: *const Self) []const u8 {
+        std.debug.assert(self.text_len <= MAX_NATIVE_SUMMARY_LEN);
+        return self.text_buf[0..self.text_len];
+    }
+
+    pub fn signature(self: *const Self) []const u8 {
+        std.debug.assert(self.signature_len <= MAX_SIGNATURE_LEN);
+        return self.signature_buf[0..self.signature_len];
+    }
+
+    /// Null when the block had none (the common case).
+    pub fn encryptedContent(self: *const Self) ?[]const u8 {
+        std.debug.assert(self.encrypted_len <= MAX_ENCRYPTED_CONTENT_LEN);
+        if (self.encrypted_len == 0) return null;
+        return self.encrypted_buf[0..self.encrypted_len];
+    }
+
+    pub fn isEmpty(self: *const Self) bool {
+        return self.text_len == 0;
+    }
+
+    /// A native block, sendable as-is to a model that supports compaction.
+    pub fn isNative(self: *const Self) bool {
+        if (self.signature_len > 0) std.debug.assert(self.text_len > 0);
+        return self.signature_len > 0;
+    }
+
+    pub fn clear(self: *Self) void {
+        self.text_len = 0;
+        self.signature_len = 0;
+        self.encrypted_len = 0;
+        std.debug.assert(self.isEmpty() and !self.isNative());
+    }
+
+    /// Client-side summary: truncated to `MAX_SUMMARY_LEN` on a UTF-8
+    /// boundary, no signature. Returns false (and leaves `self` alone) when
+    /// nothing would be left.
+    pub fn setText(self: *Self, summary_text: []const u8) bool {
+        const len = utf8SafeLen(summary_text, MAX_SUMMARY_LEN);
+        if (len == 0) return false;
+        @memcpy(self.text_buf[0..len], summary_text[0..len]);
+        self.text_len = @intCast(len);
+        self.signature_len = 0;
+        self.encrypted_len = 0;
+        std.debug.assert(!self.isNative());
+        return true;
+    }
+
+    /// Native block, stored verbatim. Returns false (and leaves `self`
+    /// alone) when a field is empty where the API requires it, or does not
+    /// fit: truncating would invalidate the signature.
+    pub fn setNative(
+        self: *Self,
+        content: []const u8,
+        block_signature: []const u8,
+        encrypted_content: ?[]const u8,
+    ) bool {
+        const encrypted = encrypted_content orelse "";
+        if (content.len == 0 or block_signature.len == 0) return false;
+        if (content.len > MAX_NATIVE_SUMMARY_LEN) return false;
+        if (block_signature.len > MAX_SIGNATURE_LEN) return false;
+        if (encrypted.len > MAX_ENCRYPTED_CONTENT_LEN) return false;
+
+        @memcpy(self.text_buf[0..content.len], content);
+        @memcpy(self.signature_buf[0..block_signature.len], block_signature);
+        @memcpy(self.encrypted_buf[0..encrypted.len], encrypted);
+        self.text_len = @intCast(content.len);
+        self.signature_len = @intCast(block_signature.len);
+        self.encrypted_len = @intCast(encrypted.len);
+        std.debug.assert(self.isNative());
+        return true;
+    }
+
+    pub fn copyFrom(self: *Self, other: *const Self) void {
+        @memcpy(self.text_buf[0..other.text_len], other.text());
+        @memcpy(self.signature_buf[0..other.signature_len], other.signature());
+        @memcpy(self.encrypted_buf[0..other.encrypted_len], other.encrypted_buf[0..other.encrypted_len]);
+        self.text_len = other.text_len;
+        self.signature_len = other.signature_len;
+        self.encrypted_len = other.encrypted_len;
+        std.debug.assert(self.isNative() == other.isNative());
+    }
+};
+
+// =============================================================================
 // Tests
 // =============================================================================
+
+test "Summary.setText truncates a client summary and carries no signature" {
+    var summary: Summary = .{};
+    try std.testing.expect(summary.setNative("old", "sig", "enc"));
+
+    const long: [MAX_SUMMARY_LEN + 10]u8 = @splat('a');
+    try std.testing.expect(summary.setText(&long));
+    try std.testing.expectEqual(MAX_SUMMARY_LEN, summary.text().len);
+    try std.testing.expect(!summary.isNative());
+    try std.testing.expectEqual(@as(?[]const u8, null), summary.encryptedContent());
+
+    try std.testing.expect(!summary.setText(""));
+    try std.testing.expectEqual(MAX_SUMMARY_LEN, summary.text().len);
+}
+
+test "Summary.setNative keeps the block verbatim past the client-summary cap" {
+    // A native summary longer than MAX_SUMMARY_LEN must not be truncated:
+    // the signature covers the content.
+    var summary: Summary = .{};
+    const content: [MAX_SUMMARY_LEN * 2]u8 = @splat('b');
+    try std.testing.expect(summary.setNative(&content, "sig", null));
+    try std.testing.expectEqualStrings(&content, summary.text());
+    try std.testing.expectEqualStrings("sig", summary.signature());
+    try std.testing.expect(summary.isNative());
+    try std.testing.expectEqual(@as(?[]const u8, null), summary.encryptedContent());
+}
+
+test "Summary.setNative refuses an oversized or unsigned block and keeps the old one" {
+    var summary: Summary = .{};
+    try std.testing.expect(summary.setText("kept"));
+
+    const too_long: [MAX_NATIVE_SUMMARY_LEN + 1]u8 = @splat('c');
+    try std.testing.expect(!summary.setNative(&too_long, "sig", null));
+    try std.testing.expect(!summary.setNative("content", "", null));
+    const big_signature: [MAX_SIGNATURE_LEN + 1]u8 = @splat('s');
+    try std.testing.expect(!summary.setNative("content", &big_signature, null));
+
+    try std.testing.expectEqualStrings("kept", summary.text());
+    try std.testing.expect(!summary.isNative());
+}
+
+test "Summary.copyFrom copies every field, including encrypted content" {
+    var a: Summary = .{};
+    var b: Summary = .{};
+    try std.testing.expect(a.setNative("summary text", "signature", "opaque"));
+    try std.testing.expect(b.setText("something longer than the source"));
+    b.copyFrom(&a);
+    try std.testing.expectEqualStrings("summary text", b.text());
+    try std.testing.expectEqualStrings("signature", b.signature());
+    try std.testing.expectEqualStrings("opaque", b.encryptedContent().?);
+
+    a.clear();
+    b.copyFrom(&a);
+    try std.testing.expect(b.isEmpty());
+    try std.testing.expect(!b.isNative());
+}
 
 test "thresholdTokens is the configured fraction of the window" {
     try std.testing.expectEqual(@as(u64, 50_000), thresholdTokens(200_000));

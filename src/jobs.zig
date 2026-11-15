@@ -16,6 +16,8 @@
 //!     returns; it posts a `.compaction` result only after its last write to
 //!     `exchange.summary`, and the main thread reads that buffer only while
 //!     delivering that result. The post's ring is the happens-before edge.
+//!   - `exchange.compaction_support` belongs to chat jobs alone, and at most
+//!     one runs at a time (`AppState.chat_job`).
 //!   - The clients are written once in `on_init`, before any job exists.
 
 const std = @import("std");
@@ -31,8 +33,15 @@ const Model = state.Model;
 const MessageRole = state.MessageRole;
 const MAX_MESSAGES = state.MAX_MESSAGES;
 const MAX_MESSAGE_LEN = state.MAX_MESSAGE_LEN;
-const MAX_SUMMARY_LEN = state.MAX_SUMMARY_LEN;
+const Summary = compaction.Summary;
 const MAX_FILE_PATH_LEN = state.MAX_FILE_PATH_LEN;
+
+comptime {
+    // The native summary must fit the buffer whatever its length, since it
+    // cannot be truncated: the output cap bounds it at ~4 bytes a token.
+    std.debug.assert(anthropic.COMPACTION_MAX_TOKENS * compaction.CHARS_PER_TOKEN <=
+        compaction.MAX_NATIVE_SUMMARY_LEN);
+}
 
 /// Text bytes one posted result carries: a streamed delta piece, an error
 /// message, or a transcript. `MAX_INPUT_LEN`, so a transcript fits in one.
@@ -47,7 +56,10 @@ pub const Exchange = struct {
     openai_client: ?openai.OpenAIClient = null,
     conversation: Conversation = .{},
     /// The summary the chat job computed, read by `AppState.onChatResult`.
-    summary: [MAX_SUMMARY_LEN]u8 = undefined,
+    summary: Summary = .{},
+    /// Per model: does it support native on-demand compaction? Null until
+    /// the Models API has answered once; an unknown answer is not cached.
+    compaction_support: [state.MODEL_COUNT]?bool = @splat(null),
 };
 
 /// A piece of text a job posts, copied into the result slot.
@@ -78,7 +90,7 @@ pub const Text = struct {
 pub const CompactionView = struct {
     /// Empty when nothing has been compacted, in which case `covers` is 0
     /// and the builders send the whole ring.
-    summary: []const u8,
+    summary: *const Summary,
     covers: u64,
 };
 
@@ -92,8 +104,7 @@ pub const Conversation = struct {
     starts: [MAX_MESSAGES]u32 = undefined,
     lens: [MAX_MESSAGES]u32 = undefined,
     text: [MAX_MESSAGES * MAX_MESSAGE_LEN]u8 = undefined,
-    summary: [MAX_SUMMARY_LEN]u8 = undefined,
-    summary_len: u32 = 0,
+    summary: Summary = .{},
     summary_covers: u64 = 0,
     model: Model = .haiku,
     attachment_path: [MAX_FILE_PATH_LEN]u8 = undefined,
@@ -105,7 +116,6 @@ pub const Conversation = struct {
     /// attachment out of `app`. Main thread, only while no chat job runs.
     pub fn capture(self: *Self, app: *const state.AppState, attachment: []const u8) void {
         std.debug.assert(app.message_count <= MAX_MESSAGES);
-        std.debug.assert(app.summary_len <= MAX_SUMMARY_LEN);
         std.debug.assert(attachment.len <= MAX_FILE_PATH_LEN);
 
         var offset: u32 = 0;
@@ -123,8 +133,7 @@ pub const Conversation = struct {
         std.debug.assert(offset <= self.text.len);
         self.count = i;
         self.messages_total = app.messages_total;
-        @memcpy(self.summary[0..app.summary_len], app.summary_buf[0..app.summary_len]);
-        self.summary_len = @intCast(app.summary_len);
+        self.summary.copyFrom(&app.summary);
         self.summary_covers = app.summary_covers;
         self.model = app.selected_model;
         @memcpy(self.attachment_path[0..attachment.len], attachment);
@@ -148,9 +157,8 @@ pub const Conversation = struct {
 
     /// The compaction state the main thread held at capture.
     fn liveCompactionView(self: *const Self) CompactionView {
-        std.debug.assert(self.summary_len <= MAX_SUMMARY_LEN);
-        if (self.summary_len == 0) std.debug.assert(self.summary_covers == 0);
-        return .{ .summary = self.summary[0..self.summary_len], .covers = self.summary_covers };
+        if (self.summary.isEmpty()) std.debug.assert(self.summary_covers == 0);
+        return .{ .summary = &self.summary, .covers = self.summary_covers };
     }
 
     /// Logical index of the first `.user` turn at or after `from`, or null
@@ -197,9 +205,7 @@ pub const Conversation = struct {
     /// files are inlined into the request by the client and never appear in
     /// the messages, so a single attached file dwarfs the text history.
     fn estimatedTokens(self: *const Self, view: CompactionView, attachment_bytes: u64) u32 {
-        std.debug.assert(view.summary.len <= MAX_SUMMARY_LEN);
-
-        var chars: u64 = state.CHAT_SYSTEM_INSTRUCTION.len + view.summary.len + attachment_bytes;
+        var chars: u64 = state.CHAT_SYSTEM_INSTRUCTION.len + view.summary.text().len + attachment_bytes;
         var i = self.retainedStart(view.covers);
         while (i < self.count) : (i += 1) {
             chars += self.lens[i];
@@ -247,7 +253,7 @@ pub const Conversation = struct {
 // =============================================================================
 
 const SYSTEM_BUFFER_LEN: usize =
-    state.CHAT_SYSTEM_INSTRUCTION.len + compaction.SUMMARY_PREAMBLE.len + MAX_SUMMARY_LEN;
+    state.CHAT_SYSTEM_INSTRUCTION.len + compaction.SUMMARY_PREAMBLE.len + compaction.MAX_NATIVE_SUMMARY_LEN;
 
 /// Composes the system instruction a request carries: the standing
 /// plain-text rules, plus the compaction summary when there is one. The
@@ -255,7 +261,7 @@ const SYSTEM_BUFFER_LEN: usize =
 /// concatenated into `out`, sized from both operands.
 fn composeSystemInstruction(out: *[SYSTEM_BUFFER_LEN]u8, summary: []const u8) []const u8 {
     if (summary.len == 0) return state.CHAT_SYSTEM_INSTRUCTION;
-    std.debug.assert(summary.len <= MAX_SUMMARY_LEN);
+    std.debug.assert(summary.len <= compaction.MAX_NATIVE_SUMMARY_LEN);
 
     const head = state.CHAT_SYSTEM_INSTRUCTION ++ compaction.SUMMARY_PREAMBLE;
     @memcpy(out[0..head.len], head);
@@ -274,13 +280,27 @@ const ChatMessagesBuffer = struct {
     system_buf: [SYSTEM_BUFFER_LEN]u8 = undefined,
 };
 
+/// The block a native summary is sent back as.
+fn blockOf(summary: *const Summary) anthropic.CompactionBlock {
+    std.debug.assert(summary.isNative());
+    return .{
+        .content = summary.text(),
+        .signature = summary.signature(),
+        .encrypted_content = summary.encryptedContent(),
+    };
+}
+
 /// Builds an Anthropic request starting at `view`'s cut, with `view.summary`
-/// standing in for the omitted turns.
+/// standing in for the omitted turns: sent back as the native block when
+/// `native` (the summary is one and the model supports it), otherwise as
+/// text in the system prompt.
 fn buildAnthropicChatRequest(
     conversation: *const Conversation,
     buf: *ChatMessagesBuffer,
     view: CompactionView,
+    native: bool,
 ) anthropic.ChatRequest {
+    if (native) std.debug.assert(view.summary.isNative());
     buf.count = 0;
     var i: usize = conversation.retainedStart(view.covers);
     while (i < conversation.count and buf.count < MAX_MESSAGES) : (i += 1) {
@@ -295,7 +315,45 @@ fn buildAnthropicChatRequest(
     return .{
         .model = conversation.model.apiName(),
         .messages = buf.messages[0..buf.count],
-        .system = composeSystemInstruction(&buf.system_buf, view.summary),
+        .system = composeSystemInstruction(&buf.system_buf, if (native) "" else view.summary.text()),
+        .compaction_block = if (native) blockOf(view.summary) else null,
+    };
+}
+
+/// Builds the native compaction request for `[from, to)`: the same system
+/// prompt and summary a chat request would carry, then the messages to
+/// fold in. `compact` adds `"compaction":{"type":"summarize"}`. The model
+/// summarizes everything it is sent, so the retained tail is left out, and
+/// a previous block leads so the new one subsumes it.
+fn buildNativeCompactionRequest(
+    conversation: *const Conversation,
+    buf: *ChatMessagesBuffer,
+    live: CompactionView,
+    from: usize,
+    to: usize,
+) anthropic.ChatRequest {
+    std.debug.assert(from < to);
+    std.debug.assert(to <= conversation.count);
+
+    buf.count = 0;
+    var i = from;
+    while (i < to and buf.count < MAX_MESSAGES) : (i += 1) {
+        const role: anthropic.ChatRole = switch (conversation.role(i)) {
+            .user => .user,
+            .assistant => .assistant,
+            .system => continue,
+        };
+        buf.messages[buf.count] = anthropic.ChatMessage.text(role, conversation.textOf(i));
+        buf.count += 1;
+    }
+    std.debug.assert(buf.count > 0);
+
+    const native = live.summary.isNative();
+    return .{
+        .model = conversation.model.apiName(),
+        .messages = buf.messages[0..buf.count],
+        .system = composeSystemInstruction(&buf.system_buf, if (native) "" else live.summary.text()),
+        .compaction_block = if (native) blockOf(live.summary) else null,
     };
 }
 
@@ -316,7 +374,7 @@ fn buildOpenAIChatRequest(
     buf.count = 0;
     buf.messages[buf.count] = openai.ChatMessage.text(
         .system,
-        composeSystemInstruction(&buf.system_buf, view.summary),
+        composeSystemInstruction(&buf.system_buf, view.summary.text()),
     );
     buf.count += 1;
 
@@ -350,10 +408,11 @@ fn buildSummaryRequest(
     std.debug.assert(to <= conversation.count);
 
     buf.count = 0;
-    if (view.summary.len > 0) {
+    if (!view.summary.isEmpty()) {
         // The Messages API merges consecutive same-role turns, so the only
-        // rule that binds is "the first message is user", which holds.
-        buf.messages[buf.count] = anthropic.ChatMessage.text(.user, view.summary);
+        // rule that binds is "the first message is user", which holds. A
+        // native summary's text works here too; its signature is dropped.
+        buf.messages[buf.count] = anthropic.ChatMessage.text(.user, view.summary.text());
         buf.count += 1;
     }
 
@@ -384,7 +443,9 @@ fn buildSummaryRequest(
 // ChatJob
 // =============================================================================
 
-/// One chat turn: compact if needed, then stream the reply.
+/// One chat turn: compact if needed, then stream the reply. Compaction is
+/// native (Anthropic's signed `compaction` block) on models that support
+/// it, and the client-side summary otherwise or when the native call fails.
 ///
 /// Posts any number of `.delta`s, at most one `.compaction` (before the
 /// first delta), and at most one `.failure`, which is last. A reply longer
@@ -397,9 +458,8 @@ pub const ChatJob = struct {
     pub const Result = union(enum) {
         delta: Text,
         failure: Text,
+        /// `exchange.summary` holds the new summary.
         compaction: struct {
-            /// Bytes of `exchange.summary`.
-            len: u32,
             /// New `AppState.summary_covers`: the realized cut.
             covers: u64,
         },
@@ -413,8 +473,10 @@ pub const ChatJob = struct {
             .anthropic => {
                 const client = &exchange.anthropic_client.?;
                 const view = try runCompaction(job, client, conversation);
+                const native = view.summary.isNative() and
+                    nativeCompactionSupported(client, conversation.model);
                 var buf: ChatMessagesBuffer = .{};
-                const request = buildAnthropicChatRequest(conversation, &buf, view);
+                const request = buildAnthropicChatRequest(conversation, &buf, view, native);
                 const sink = anthropic.StreamSink{
                     .userdata = &stream,
                     .callback = Stream.anthropicDelta,
@@ -478,6 +540,12 @@ pub const ChatJob = struct {
             .{ estimate, window_tokens, cut.from, cut.to },
         );
 
+        if (nativeCompactionSupported(client, conversation.model)) {
+            if (try compactNative(job, client, conversation, live, cut.from, cut.to)) {
+                return adopt(job, cut.covers);
+            }
+        }
+
         var buf: ChatMessagesBuffer = .{};
         const request = buildSummaryRequest(conversation, &buf, live, cut.from, cut.to);
         var result = client.sendBlocking(request);
@@ -490,19 +558,67 @@ pub const ChatJob = struct {
             });
             return live;
         };
-        const len = compaction.utf8SafeLen(text, MAX_SUMMARY_LEN);
-        if (len == 0) return live;
-        std.debug.assert(len <= MAX_SUMMARY_LEN);
+        if (!exchange.summary.setText(text)) return live;
+        log.info("compaction: client-side summary, {d} bytes", .{exchange.summary.text().len});
+        return adopt(job, cut.covers);
+    }
 
-        // Last write to `exchange.summary` before the post that hands it to
-        // the main thread; this request keeps reading it, which is safe.
-        @memcpy(exchange.summary[0..len], text[0..len]);
-        const posted: ChatJob.Result = .{ .compaction = .{
-            .len = @intCast(len),
-            .covers = cut.covers,
-        } };
-        if (!job.post(&posted)) return error.Canceled;
-        return .{ .summary = exchange.summary[0..len], .covers = cut.covers };
+    /// Asks Anthropic for a native block over `[from, to)` and stages it in
+    /// `exchange.summary`. False when the call fails or returns no block
+    /// that fits, so the caller falls back to the client-side summary.
+    fn compactNative(
+        job: *gooey.Job(Result),
+        client: *anthropic.AnthropicClient,
+        conversation: *const Conversation,
+        live: CompactionView,
+        from: usize,
+        to: usize,
+    ) !bool {
+        var buf: ChatMessagesBuffer = .{};
+        const request = buildNativeCompactionRequest(conversation, &buf, live, from, to);
+        var result = client.compact(request);
+        defer result.deinit();
+        if (job.cancelled()) return error.Canceled;
+
+        const block = switch (result.status) {
+            .success => |block| block,
+            .err => |message| {
+                log.warn("compaction: native compaction failed ({s}), using the client-side summary", .{message});
+                return false;
+            },
+        };
+        if (!exchange.summary.setNative(block.content, block.signature, block.encrypted_content)) {
+            log.warn("compaction: native block too large ({d} + {d} bytes), using the client-side summary", .{
+                block.content.len, block.signature.len,
+            });
+            return false;
+        }
+        log.info("compaction: native block, {d} bytes of summary", .{block.content.len});
+        return true;
+    }
+
+    /// Hands the summary staged in `exchange.summary` to the main thread
+    /// and returns the view this request builds from. The post is the last
+    /// write's happens-before edge; this request keeps reading the buffer,
+    /// which is safe because nothing writes it again in this job.
+    fn adopt(job: *gooey.Job(Result), covers: u64) !CompactionView {
+        std.debug.assert(!exchange.summary.isEmpty());
+        if (!job.post(&.{ .compaction = .{ .covers = covers } })) return error.Canceled;
+        return .{ .summary = &exchange.summary, .covers = covers };
+    }
+
+    /// Whether `model` supports native compaction, asking the Models API
+    /// the first time and caching a definite answer for the process.
+    fn nativeCompactionSupported(client: *anthropic.AnthropicClient, model: Model) bool {
+        std.debug.assert(model.provider() == .anthropic);
+        const slot = &exchange.compaction_support[@backingInt(model)];
+        if (slot.*) |known| return known;
+        const answer = client.compactionSupported(model.apiName()) orelse return false;
+        slot.* = answer;
+        log.info("compaction: {s} {s} native compaction", .{
+            model.apiName(), if (answer) "supports" else "does not support",
+        });
+        return answer;
     }
 
     /// Size of the staged attachment, or 0 when none is staged or it can't

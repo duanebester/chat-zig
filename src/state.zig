@@ -73,14 +73,12 @@ const DEFAULT_DEVICE_MARKER = "\xe2\x97\x8f ";
 // the summary is a derived cache that only affects *request assembly*, so
 // `streaming_message_idx` and the transcript's rendered order stay valid
 // across a compaction. Failure is therefore free:
-// leave `summary_len` alone and the next request is simply the
+// leave `summary` alone and the next request is simply the
 // uncompacted one.
 //
 // The tuning constants, prompts, and cut arithmetic live in
 // `compaction.zig` so they can be unit-tested without pulling gooey into
 // the test binary; what stays here is the part that needs the ring.
-
-pub const MAX_SUMMARY_LEN = compaction.MAX_SUMMARY_LEN;
 
 /// Longest banner `AppState.compactionBanner` can format — the template
 /// plus a u64 rendered in full.
@@ -165,18 +163,18 @@ pub const Model = enum(u8) {
     gpt_luna,
 
     pub const display_names = [_][]const u8{
-        "Claude 4.5 Haiku",
-        "Claude Sonnet 5",
-        "Claude Opus 5",
+        "Claude Haiku 5.5",
+        "Claude Sonnet 5.5",
+        "Claude Opus 5.5",
         "GPT-5.6 Sol",
         "GPT-5.6 Terra",
         "GPT-5.6 Luna",
     };
 
     pub const api_names = [_][]const u8{
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-5",
-        "claude-opus-5",
+        "claude-haiku-5-5",
+        "claude-sonnet-5-5",
+        "claude-opus-5-5",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -200,10 +198,13 @@ pub const Model = enum(u8) {
     ///
     /// Conservative by design: this only decides *when* compaction fires,
     /// and under-stating the window means compacting slightly early, which
-    /// is the harmless direction to be wrong in.
+    /// is the harmless direction to be wrong in. The Claude values are the
+    /// Models API's `max_input_tokens` for each 5.5 model (checked
+    /// 2026-11-15); their 128k `max_tokens` is far above the app's own
+    /// output caps (`anthropic.MAX_TOKENS`, `COMPACTION_MAX_TOKENS`).
     pub const context_window_tokens = [_]u32{
-        200_000, 200_000, 200_000,
-        272_000, 272_000, 272_000,
+        1_000_000, 1_000_000, 1_000_000,
+        272_000,   272_000,   272_000,
     };
 
     pub fn displayName(self: Model) []const u8 {
@@ -363,8 +364,8 @@ pub const AppState = struct {
     // `adoptCompaction` copies it here. Nothing below ever touches
     // `messages`.
 
-    summary_buf: [MAX_SUMMARY_LEN]u8 = undefined,
-    summary_len: usize = 0,
+    /// Client-side text, or Anthropic's native block (text plus signature).
+    summary: compaction.Summary = .{},
     /// Value of `messages_total` at the compaction cut: the summary covers
     /// every message added before this point. Stored against the monotonic
     /// counter rather than a logical index because logical indices decay —
@@ -684,7 +685,7 @@ pub const AppState = struct {
         switch (result.*) {
             .delta => |*text| self.appendDelta(text.slice()),
             .failure => |*text| self.failChat(text.slice()),
-            .compaction => |cut| self.adoptCompaction(cut.len, cut.covers),
+            .compaction => |cut| self.adoptCompaction(cut.covers),
         }
     }
 
@@ -780,18 +781,19 @@ pub const AppState = struct {
     /// Adopt the summary the job staged in `jobs.exchange.summary`,
     /// advancing the cut every future request assembles from. Nothing here
     /// touches `messages`, so the transcript and its scroll are unchanged.
-    /// Also durably records the summary, so a restored session inherits it.
-    fn adoptCompaction(self: *Self, len: u32, covers: u64) void {
-        std.debug.assert(len > 0);
-        std.debug.assert(len <= MAX_SUMMARY_LEN);
+    /// Also durably records the summary, signature included, so a restored
+    /// session inherits it.
+    fn adoptCompaction(self: *Self, covers: u64) void {
+        std.debug.assert(!jobs.exchange.summary.isEmpty());
         std.debug.assert(covers > self.summary_covers); // Must make progress.
         std.debug.assert(covers <= self.messages_total);
 
-        @memcpy(self.summary_buf[0..len], jobs.exchange.summary[0..len]);
-        self.summary_len = len;
+        self.summary.copyFrom(&jobs.exchange.summary);
         self.summary_covers = covers;
-        self.session_log.logSummary(self.io, self.messages_total, covers, self.summary_buf[0..len]);
-        log.info("compaction applied: {d} messages now summarized in {d} bytes", .{ covers, len });
+        self.session_log.logSummary(self.io, self.messages_total, covers, &self.summary);
+        log.info("compaction applied: {d} messages now summarized in {d} bytes ({s})", .{
+            covers, self.summary.text().len, if (self.summary.isNative()) "native" else "client-side",
+        });
     }
 
     /// Clears the derived compaction state. Called wherever the transcript
@@ -799,9 +801,9 @@ pub const AppState = struct {
     /// against a different conversation would silently truncate the new
     /// one's history.
     fn clearCompaction(self: *Self) void {
-        self.summary_len = 0;
+        self.summary.clear();
         self.summary_covers = 0;
-        std.debug.assert(self.summary_len == 0);
+        std.debug.assert(self.summary.isEmpty());
         std.debug.assert(self.summary_covers == 0);
     }
 
@@ -812,7 +814,7 @@ pub const AppState = struct {
     /// sync with `summary_covers` at each write point, so there is no
     /// second source of truth that can drift. Main thread only.
     pub fn compactionBanner(self: *Self) ?[]const u8 {
-        if (self.summary_len == 0) return null;
+        if (self.summary.isEmpty()) return null;
         std.debug.assert(self.summary_covers > 0);
 
         return std.fmt.bufPrint(
@@ -951,17 +953,20 @@ pub const AppState = struct {
             /// one — see `buildSummaryRequest`), so plain assignment in
             /// file order lands on the right cut.
             fn onSummary(ctx: *@This(), s: session_log_mod.LoadedSummary) void {
-                const len = @min(s.text.len, MAX_SUMMARY_LEN);
-                if (len == 0) return;
                 // A summary that covers nothing is not a summary. Only a
                 // truncated or hand-edited file can produce one, but
-                // adopting it would leave `summary_len > 0` alongside
+                // adopting it would leave a summary alongside
                 // `summary_covers == 0` — a state the guard below cannot
                 // see and `compactionBanner` asserts against on the very
                 // next frame.
                 if (s.covers == 0) return;
-                @memcpy(ctx.app.summary_buf[0..len], s.text[0..len]);
-                ctx.app.summary_len = len;
+                // A native block is restored verbatim or not at all (an
+                // altered one is a 400); a client summary is truncated.
+                const adopted = if (s.signature) |signature|
+                    ctx.app.summary.setNative(s.text, signature, s.encrypted_content)
+                else
+                    ctx.app.summary.setText(s.text);
+                if (!adopted) return;
                 ctx.app.summary_covers = s.covers;
                 if (s.seq >= ctx.max_seq_seen) ctx.max_seq_seen = s.seq;
             }
@@ -997,7 +1002,7 @@ pub const AppState = struct {
         // history away, so drop the summary outright. Only reachable via a
         // truncated or hand-edited file.
         if (self.summary_covers > self.messages_total) self.clearCompaction();
-        if (self.summary_len == 0) std.debug.assert(self.summary_covers == 0);
+        if (self.summary.isEmpty()) std.debug.assert(self.summary_covers == 0);
 
         self.history_expanded = false;
     }
