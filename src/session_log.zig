@@ -31,9 +31,7 @@
 //!
 //! A summary with `signature` (and sometimes `encrypted_content`) is
 //! Anthropic's native compaction block: `text` is its `content`, and the
-//! three fields are sent back exactly as written. A build that predates
-//! native compaction ignores the extra fields and adopts `text` as a
-//! client-side summary, which still works.
+//! three fields are sent back exactly as written.
 
 const std = @import("std");
 const log = std.log.scoped(.chatzig);

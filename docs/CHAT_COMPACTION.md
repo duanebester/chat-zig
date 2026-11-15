@@ -487,9 +487,10 @@ turn of a client-side summarization, and for OpenAI.
 - **Support** comes from the Models API (`capabilities.compaction.summarize`),
   asked once per model by the chat job and cached for the process
   (`jobs.exchange.compaction_support`). An unknown answer (network error) is
-  not cached and counts as unsupported for that turn. Claude 4.5 Haiku, the
-  default model, does not support it, so it always takes the fallback;
-  Sonnet 5 and Opus 5 do.
+  not cached and counts as unsupported for that turn. All three Claude
+  entries (Haiku 5.5, the default, Sonnet 5.5 and Opus 5.5) support it;
+  the fallback covers older models such as Claude 4.5 Haiku, which the API
+  rejects for on-demand compaction.
 - **Fallback.** An unsupported model, a failed call, a 200 with no block
   (`max_tokens`, `refusal`, ...), or a block over the caps all fall through
   to the client-side haiku summary, and if that fails too, to the
@@ -501,9 +502,7 @@ turn of a client-side summarization, and for OpenAI.
   about 32 KiB, which `jobs.zig` asserts at compile time. Measured live, an
   11k-token conversation produced 8.9 KB of content and a 1.6 KB signature.
 - **Persistence.** The summary line gains `signature` and
-  `encrypted_content`, so a restored session sends the same block. A build
-  that predates this ignores both fields and uses the text as a client-side
-  summary.
+  `encrypted_content`, so a restored session sends the same block.
 
 ## Failure behavior
 

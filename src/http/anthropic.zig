@@ -1679,12 +1679,12 @@ test "ChatRequest structure" {
     };
 
     const request = ChatRequest{
-        .model = "claude-haiku-4-5-20251001",
+        .model = "claude-haiku-5-5",
         .messages = &messages,
         .system = "Plain text only.",
     };
 
-    try std.testing.expectEqualStrings("claude-haiku-4-5-20251001", request.model);
+    try std.testing.expectEqualStrings("claude-haiku-5-5", request.model);
     try std.testing.expectEqual(@as(usize, 2), request.messages.len);
     try std.testing.expectEqualStrings("Plain text only.", request.system.?);
     try std.testing.expectEqualStrings("user", request.messages[0].role.apiName());

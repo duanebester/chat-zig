@@ -163,18 +163,18 @@ pub const Model = enum(u8) {
     gpt_luna,
 
     pub const display_names = [_][]const u8{
-        "Claude 4.5 Haiku",
-        "Claude Sonnet 5",
-        "Claude Opus 5",
+        "Claude Haiku 5.5",
+        "Claude Sonnet 5.5",
+        "Claude Opus 5.5",
         "GPT-5.6 Sol",
         "GPT-5.6 Terra",
         "GPT-5.6 Luna",
     };
 
     pub const api_names = [_][]const u8{
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-5",
-        "claude-opus-5",
+        "claude-haiku-5-5",
+        "claude-sonnet-5-5",
+        "claude-opus-5-5",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -198,10 +198,13 @@ pub const Model = enum(u8) {
     ///
     /// Conservative by design: this only decides *when* compaction fires,
     /// and under-stating the window means compacting slightly early, which
-    /// is the harmless direction to be wrong in.
+    /// is the harmless direction to be wrong in. The Claude values are the
+    /// Models API's `max_input_tokens` for each 5.5 model (checked
+    /// 2026-11-15); their 128k `max_tokens` is far above the app's own
+    /// output caps (`anthropic.MAX_TOKENS`, `COMPACTION_MAX_TOKENS`).
     pub const context_window_tokens = [_]u32{
-        200_000, 200_000, 200_000,
-        272_000, 272_000, 272_000,
+        1_000_000, 1_000_000, 1_000_000,
+        272_000,   272_000,   272_000,
     };
 
     pub fn displayName(self: Model) []const u8 {
