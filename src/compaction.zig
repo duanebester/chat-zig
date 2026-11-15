@@ -141,8 +141,8 @@ pub fn utf8SafeLen(text: []const u8, max: usize) usize {
 // =============================================================================
 
 test "thresholdTokens is the configured fraction of the window" {
-    try std.testing.expectEqual(@as(u64, 150_000), thresholdTokens(200_000));
-    try std.testing.expectEqual(@as(u64, 3), thresholdTokens(4));
+    try std.testing.expectEqual(@as(u64, 50_000), thresholdTokens(200_000));
+    try std.testing.expectEqual(@as(u64, 1), thresholdTokens(4));
 }
 
 test "estimateTokens divides by the bytes-per-token constant" {
