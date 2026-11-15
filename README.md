@@ -21,7 +21,7 @@ Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version
 
 - 💬 Chat with Claude and GPT models, switchable per-conversation from the settings panel
 - 🎙️ Voice dictation — record a microphone clip and transcribe it via OpenAI (`gpt-4o-mini-transcribe`)
-- 🧹 Automatic chat compaction — long conversations are summarized so requests stay bounded (see [`docs/CHAT_COMPACTION.md`](docs/CHAT_COMPACTION.md))
+- 🧹 Automatic chat compaction — long conversations are summarized so requests stay bounded, with Anthropic's native compaction where the model supports it (see [`docs/CHAT_COMPACTION.md`](docs/CHAT_COMPACTION.md))
 - 💾 Session persistence — conversations are logged to `sessions/*.jsonl` and browsable/restorable from a history panel
 - 🎨 Light/dark theme
 - 📜 Streaming replies into a scrolling transcript of any length that follows the newest message
@@ -112,7 +112,10 @@ the bottom; scrolling up releases it, and sending a message jumps back down.
 
 Long conversations are summarized rather than truncated: `AppState.messages`
 is never mutated, and a small summary + cut index is layered on top only
-when assembling the next request. See
+when assembling the next request. On Claude models that support it, the
+summary is Anthropic's native on-demand compaction block (signed, sent back
+verbatim, and kept in the session log); other models, or a failed
+compaction call, fall back to a client-side summary. See
 [`docs/CHAT_COMPACTION.md`](docs/CHAT_COMPACTION.md) for the full design,
 including how the cut is computed across ring-buffer overflow and how
 sessions are framed and restored from `sessions/*.jsonl`.

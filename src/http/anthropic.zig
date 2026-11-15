@@ -31,6 +31,11 @@ const Allocator = std.mem.Allocator;
 const API_URL = "https://api.anthropic.com/v1/messages";
 const FILES_API_URL = "https://api.anthropic.com/v1/files";
 const MAX_TOKENS: u32 = 4096;
+/// Output cap for a native compaction call. It covers the summary and any
+/// thinking before it; "allow several thousand tokens", per the docs. A
+/// summary cut off by it comes back with `stop_reason` `max_tokens` and no
+/// block. `jobs.zig` asserts it fits `compaction.MAX_NATIVE_SUMMARY_LEN`.
+pub const COMPACTION_MAX_TOKENS: u32 = 8192;
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB
 const MAX_REQUEST_SIZE: usize = 8 * 1024 * 1024; // 8MB base JSON buffer
 const MAX_HTTP_REQUEST_BODY_SIZE: u32 = MAX_REQUEST_SIZE + MAX_FILE_SIZE * 2 + 1024;
@@ -118,6 +123,14 @@ pub const FileAttachment = struct {
     file_id: ?[]const u8 = null,
 };
 
+/// A native compaction block, exactly as the API returned it. Strings are
+/// borrowed; see `CompactResult` for who owns them on the way in.
+pub const CompactionBlock = struct {
+    content: []const u8,
+    signature: []const u8,
+    encrypted_content: ?[]const u8 = null,
+};
+
 pub const ChatRequest = struct {
     model: []const u8,
     messages: []const ChatMessage,
@@ -125,7 +138,32 @@ pub const ChatRequest = struct {
     system: ?[]const u8 = null,
     /// Optional file attachment (will be added to the last user message)
     attachment: ?FileAttachment = null,
+    /// Sent first in `messages`, as its own assistant message, in place of
+    /// the messages it summarizes. Adds the `compact-2026-09-04` beta.
+    compaction_block: ?CompactionBlock = null,
+    /// Ask for a summary instead of a reply (`"compaction":{"type":
+    /// "summarize"}`). Only through `compact`, which parses the block.
+    summarize: bool = false,
 };
+
+/// Beta that both requests a native summary and lets a request carry the
+/// block it returned. Required on every request that carries one.
+pub const COMPACTION_BETA = "compact-2026-09-04";
+const FILES_BETA = "files-api-2025-04-14";
+
+const MODELS_API_URL = "https://api.anthropic.com/v1/models/";
+/// One model's Models API object is about 1 KB; anything past this is not
+/// a response we understand.
+const MAX_MODEL_RESPONSE_SIZE: usize = 16 * 1024;
+const MAX_MODEL_ID_LEN: usize = 64;
+
+/// The `anthropic-beta` value for a request, or null when it needs none.
+fn betaHeaderValue(files: bool, compaction: bool) ?[]const u8 {
+    if (files and compaction) return FILES_BETA ++ "," ++ COMPACTION_BETA;
+    if (files) return FILES_BETA;
+    if (compaction) return COMPACTION_BETA;
+    return null;
+}
 
 /// Callback invoked from the HTTP fiber for each `text_delta` chunk parsed
 /// from an SSE stream. Returning `error.Aborted` from the callback short-
@@ -641,6 +679,90 @@ const ApiResponse = struct {
     content: []const ApiContentBlock,
 };
 
+const ApiCompactionResponse = struct {
+    stop_reason: ?[]const u8 = null,
+    content: []const struct {
+        type: []const u8,
+        content: ?[]const u8 = null,
+        signature: ?[]const u8 = null,
+        encrypted_content: ?[]const u8 = null,
+    },
+};
+
+/// Result of `AnthropicClient.compact`. On success the block's strings live
+/// in `parsed` until `deinit`.
+pub const CompactResult = struct {
+    status: union(enum) {
+        success: CompactionBlock,
+        err: []const u8, // static
+    },
+    parsed: ?std.json.Parsed(ApiCompactionResponse) = null,
+
+    pub fn err(msg: []const u8) CompactResult {
+        return .{ .status = .{ .err = msg } };
+    }
+
+    pub fn deinit(self: *CompactResult) void {
+        if (self.parsed) |*p| p.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Parses a compaction response body. A 200 without a block is still a
+/// failure: the summarization call can end on `max_tokens`, `refusal`, and
+/// so on with empty `content`, so `stop_reason` is checked first.
+pub fn parseCompactionResponse(allocator: Allocator, body: []const u8) CompactResult {
+    const parsed = std.json.parseFromSlice(ApiCompactionResponse, allocator, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |e| {
+        log.err("compaction: unparseable response: {t}", .{e});
+        return CompactResult.err("Failed to parse compaction response");
+    };
+
+    const stop_reason = parsed.value.stop_reason orelse "";
+    if (!std.mem.eql(u8, stop_reason, "compaction")) {
+        log.warn("compaction: no summary, stop_reason \"{s}\"", .{stop_reason});
+        parsed.deinit();
+        return CompactResult.err("Compaction returned no summary");
+    }
+    for (parsed.value.content) |block| {
+        if (!std.mem.eql(u8, block.type, "compaction")) continue;
+        const content = block.content orelse break;
+        const signature = block.signature orelse break;
+        return .{
+            .status = .{ .success = .{
+                .content = content,
+                .signature = signature,
+                .encrypted_content = block.encrypted_content,
+            } },
+            .parsed = parsed,
+        };
+    }
+    parsed.deinit();
+    return CompactResult.err("Compaction response had no block");
+}
+
+/// Reads `capabilities.compaction.summarize.supported` from one Models API
+/// object. Null when the field is missing, so the caller can tell "no" from
+/// "this response doesn't say".
+pub fn parseCompactionSupport(allocator: Allocator, body: []const u8) ?bool {
+    const Supported = struct { supported: ?bool = null };
+    const Model = struct {
+        capabilities: ?struct {
+            compaction: ?struct { summarize: ?Supported = null } = null,
+        } = null,
+    };
+    const parsed = std.json.parseFromSlice(Model, allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    const capabilities = parsed.value.capabilities orelse return null;
+    const compaction = capabilities.compaction orelse return null;
+    const summarize = compaction.summarize orelse return null;
+    return summarize.supported;
+}
+
 // =============================================================================
 // Anthropic Client
 // =============================================================================
@@ -669,6 +791,66 @@ pub const AnthropicClient = struct {
             log.err("HTTP request failed: {}", .{e});
             return ChatResult.err("Request failed");
         };
+    }
+
+    /// Native on-demand compaction: sends `request` with `"compaction":
+    /// {"type":"summarize"}` and returns the block, or an error the caller
+    /// treats as "fall back". Blocking; call from a job. The caller frees
+    /// the result with `deinit`.
+    pub fn compact(self: *Self, request: ChatRequest) CompactResult {
+        std.debug.assert(request.messages.len > 0);
+        std.debug.assert(request.attachment == null);
+
+        var summarize_request = request;
+        summarize_request.summarize = true;
+        var raw = self.doRequest(summarize_request, null) catch |e| {
+            log.err("compaction request failed: {}", .{e});
+            return CompactResult.err("Request failed");
+        };
+        defer raw.deinit(self.allocator);
+        const body = switch (raw.status) {
+            .success => |body| body,
+            .err => |message| return CompactResult.err(message),
+        };
+        return parseCompactionResponse(self.allocator, body);
+    }
+
+    /// Whether `model` supports on-demand compaction, from the Models API's
+    /// `capabilities.compaction`. Null when the answer is unknown (network
+    /// error, unexpected response), which callers treat as "not this time"
+    /// without caching it. One attempt, no retry: a miss only costs the
+    /// client-side summary.
+    pub fn compactionSupported(self: *Self, model: []const u8) ?bool {
+        std.debug.assert(model.len > 0);
+        if (model.len > MAX_MODEL_ID_LEN) return null;
+
+        var url_buf: [MODELS_API_URL.len + MAX_MODEL_ID_LEN]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, MODELS_API_URL ++ "{s}", .{model}) catch unreachable;
+
+        var client = http.Client{ .allocator = self.allocator, .io = self.io };
+        defer client.deinit();
+        var body_buf: [MAX_MODEL_RESPONSE_SIZE]u8 = undefined;
+        var body: Io.Writer = .fixed(&body_buf);
+        const headers = [_]http.Header{
+            .{ .name = "x-api-key", .value = self.api_key },
+            .{ .name = "anthropic-version", .value = "2023-06-01" },
+            .{ .name = "anthropic-beta", .value = COMPACTION_BETA },
+        };
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
+            .extra_headers = &headers,
+            .response_writer = &body,
+        }) catch |e| {
+            log.warn("compaction: Models API request for {s} failed: {t}", .{ model, e });
+            return null;
+        };
+        if (result.status != .ok) {
+            log.warn("compaction: Models API HTTP {d} for {s}", .{ @backingInt(result.status), model });
+            return null;
+        }
+        return parseCompactionSupport(self.allocator, body.buffered());
     }
 
     /// Streaming HTTP request — emits `"stream": true` in the request body
@@ -837,8 +1019,10 @@ pub const AnthropicClient = struct {
         var fbs: Io.Writer = .fixed(json_buf);
         const writer = &fbs;
 
-        try writer.print("{{\"model\":\"{s}\",\"max_tokens\":{d}", .{ request.model, MAX_TOKENS });
+        const max_tokens = if (request.summarize) COMPACTION_MAX_TOKENS else MAX_TOKENS;
+        try writer.print("{{\"model\":\"{s}\",\"max_tokens\":{d}", .{ request.model, max_tokens });
         try writeOptionalSystemField(writer, request.system);
+        if (request.summarize) try writer.writeAll(",\"compaction\":{\"type\":\"summarize\"}");
 
         // Streaming flag: when a sink is provided, ask the server for SSE.
         // Emitting this before `messages` keeps the JSON shape stable for
@@ -847,8 +1031,14 @@ pub const AnthropicClient = struct {
 
         try writer.writeAll(",\"messages\":[");
 
-        // Add conversation history
+        // The block goes first, in place of the messages it summarizes.
         var first = true;
+        if (request.compaction_block) |block| {
+            try writeCompactionBlockMessage(writer, block);
+            first = false;
+        }
+
+        // Add conversation history
         for (request.messages, 0..) |msg, msg_idx| {
             if (!first) try writer.writeAll(",");
             first = false;
@@ -946,6 +1136,8 @@ pub const AnthropicClient = struct {
             .body = body,
             .uri = uri,
             .needs_files_beta = needs_files_beta,
+            .needs_compaction_beta = request.summarize or request.compaction_block != null,
+            .raw_body = request.summarize,
             .sink = sink,
         };
 
@@ -967,6 +1159,10 @@ pub const AnthropicClient = struct {
         body: []u8,
         uri: Uri,
         needs_files_beta: bool,
+        needs_compaction_beta: bool,
+        /// Return the 200 body itself instead of extracting text from it
+        /// (the compaction response has none; `compact` parses it).
+        raw_body: bool,
         sink: ?StreamSink,
 
         pub fn attempt(c: @This()) Io.Cancelable!AttemptOutcome(ChatResult) {
@@ -975,21 +1171,18 @@ pub const AnthropicClient = struct {
 
             // These arrays stay on this frame while the shared helper creates,
             // sends, consumes, and destroys the request synchronously.
-            const extra_headers_full = [_]http.Header{
+            var headers_buf = [_]http.Header{
                 .{ .name = "Content-Type", .value = "application/json" },
                 .{ .name = "x-api-key", .value = c.self.api_key },
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
-                .{ .name = "anthropic-beta", .value = "files-api-2025-04-14" },
+                undefined,
             };
-            const extra_headers_basic = [_]http.Header{
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "x-api-key", .value = c.self.api_key },
-                .{ .name = "anthropic-version", .value = "2023-06-01" },
-            };
-            const extra_headers: []const http.Header = if (c.needs_files_beta)
-                &extra_headers_full
-            else
-                &extra_headers_basic;
+            var header_count: usize = 3;
+            if (betaHeaderValue(c.needs_files_beta, c.needs_compaction_beta)) |beta| {
+                headers_buf[3] = .{ .name = "anthropic-beta", .value = beta };
+                header_count = 4;
+            }
+            const extra_headers: []const http.Header = headers_buf[0..header_count];
             const options: net.AttemptOptions = .{
                 .io = c.self.io,
                 .allocator = c.self.allocator,
@@ -1039,7 +1232,7 @@ pub const AnthropicClient = struct {
         pub fn consumeOkResponse(c: @This(), response: *http.Client.Response) Io.Cancelable!ChatResult {
             std.debug.assert(c.self.api_key.len > 0);
             std.debug.assert(c.body.len > 0);
-            return c.self.consumeOkResponse(response, c.sink);
+            return c.self.consumeOkResponse(response, c.sink, c.raw_body);
         }
     };
 
@@ -1052,6 +1245,7 @@ pub const AnthropicClient = struct {
         self: *Self,
         response: *http.Client.Response,
         sink: ?StreamSink,
+        raw_body: bool,
     ) ChatResult {
         if (sink) |s| {
             var sse_buf: [SSE_READER_BUF_SIZE]u8 = undefined;
@@ -1074,12 +1268,13 @@ pub const AnthropicClient = struct {
             log.err("Failed to read response: {}", .{e});
             return ChatResult.err("Failed to read response");
         };
-        defer self.allocator.free(response_data);
-
         std.debug.assert(response_data.len > 0);
         if (LOG_PAYLOADS) {
             log.debug("Response ({d} bytes): {s}", .{ response_data.len, response_data });
         }
+        // Ownership of the body passes to the result.
+        if (raw_body) return ChatResult.success(response_data);
+        defer self.allocator.free(response_data);
 
         const text = parseAndExtractText(self.allocator, response_data) catch |e| {
             log.err("Failed to parse response: {}", .{e});
@@ -1303,6 +1498,24 @@ fn getFileName(path: []const u8) []const u8 {
 /// Takes a concrete `*Io.Writer`. The old `anytype` signature was a holdover
 /// from Zig 0.15 generic streams; 0.16's unified `Io.Writer` interface gives
 /// us a single concrete type and better error messages at call sites.
+/// The block as its own assistant message, every field the API returned and
+/// no others: an extra field (even `null`) is a 400.
+fn writeCompactionBlockMessage(writer: *Io.Writer, block: CompactionBlock) !void {
+    std.debug.assert(block.content.len > 0);
+    std.debug.assert(block.signature.len > 0);
+    try writer.writeAll("{\"role\":\"assistant\",\"content\":[{\"type\":\"compaction\",\"content\":\"");
+    try writeJsonEscapedString(writer, block.content);
+    try writer.writeAll("\",\"signature\":\"");
+    try writeJsonEscapedString(writer, block.signature);
+    try writer.writeByte('"');
+    if (block.encrypted_content) |encrypted| {
+        try writer.writeAll(",\"encrypted_content\":\"");
+        try writeJsonEscapedString(writer, encrypted);
+        try writer.writeByte('"');
+    }
+    try writer.writeAll("}]}");
+}
+
 fn writeOptionalSystemField(writer: *Io.Writer, system: ?[]const u8) !void {
     if (system) |instruction| {
         try writer.writeAll(",\"system\":\"");
@@ -1753,4 +1966,88 @@ test "parseRetryAfterSeconds rejects HTTP-date and garbage" {
     try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("not-a-number"));
     // Negative values are nonsensical for a delay; parseInt(u64) rejects.
     try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("-5"));
+}
+
+test "writeCompactionBlockMessage sends the block's fields and nothing else" {
+    // An extra field, even `null`, is a 400, and the content must arrive
+    // unchanged, so check the exact bytes, escapes included.
+    var buffer: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try writeCompactionBlockMessage(&writer, .{ .content = "said \"hi\"\n", .signature = "EuYB+/=" });
+    try std.testing.expectEqualStrings(
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"compaction\"," ++
+            "\"content\":\"said \\\"hi\\\"\\n\",\"signature\":\"EuYB+/=\"}]}",
+        writer.buffered(),
+    );
+
+    var with_encrypted: Io.Writer = .fixed(&buffer);
+    try writeCompactionBlockMessage(&with_encrypted, .{
+        .content = "s",
+        .signature = "g",
+        .encrypted_content = "e",
+    });
+    try std.testing.expectEqualStrings(
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"compaction\"," ++
+            "\"content\":\"s\",\"signature\":\"g\",\"encrypted_content\":\"e\"}]}",
+        with_encrypted.buffered(),
+    );
+}
+
+test "betaHeaderValue combines the files and compaction betas" {
+    try std.testing.expectEqual(@as(?[]const u8, null), betaHeaderValue(false, false));
+    try std.testing.expectEqualStrings("files-api-2025-04-14", betaHeaderValue(true, false).?);
+    try std.testing.expectEqualStrings("compact-2026-09-04", betaHeaderValue(false, true).?);
+    try std.testing.expectEqualStrings(
+        "files-api-2025-04-14,compact-2026-09-04",
+        betaHeaderValue(true, true).?,
+    );
+}
+
+test "parseCompactionResponse returns the block from a compaction stop" {
+    const body =
+        \\{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-5",
+        \\"content":[{"type":"compaction","content":"Summary: \"recipes\"","signature":"EuYB"}],
+        \\"stop_reason":"compaction","usage":{"input_tokens":0,"output_tokens":0}}
+    ;
+    var result = parseCompactionResponse(std.testing.allocator, body);
+    defer result.deinit();
+    const block = result.status.success;
+    try std.testing.expectEqualStrings("Summary: \"recipes\"", block.content);
+    try std.testing.expectEqualStrings("EuYB", block.signature);
+    try std.testing.expectEqual(@as(?[]const u8, null), block.encrypted_content);
+}
+
+test "parseCompactionResponse fails on a 200 that carries no block" {
+    // A summary cut off by max_tokens comes back as a 200 with empty
+    // content; the caller must see a failure and fall back.
+    const truncated =
+        \\{"content":[],"stop_reason":"max_tokens"}
+    ;
+    var no_summary = parseCompactionResponse(std.testing.allocator, truncated);
+    defer no_summary.deinit();
+    try std.testing.expect(no_summary.status == .err);
+
+    // A compaction stop whose block lacks a signature cannot be sent back.
+    const unsigned =
+        \\{"content":[{"type":"compaction","content":"text"}],"stop_reason":"compaction"}
+    ;
+    var no_signature = parseCompactionResponse(std.testing.allocator, unsigned);
+    defer no_signature.deinit();
+    try std.testing.expect(no_signature.status == .err);
+}
+
+test "parseCompactionSupport reads capabilities.compaction.summarize" {
+    const yes =
+        \\{"id":"claude-sonnet-5","capabilities":{"compaction":{"supported":true,"summarize":{"supported":true}}}}
+    ;
+    const no =
+        \\{"id":"claude-haiku-4-5-20251001","capabilities":{"compaction":{"supported":false,"summarize":{"supported":false}}}}
+    ;
+    const silent =
+        \\{"id":"claude-x","capabilities":{}}
+    ;
+    try std.testing.expectEqual(@as(?bool, true), parseCompactionSupport(std.testing.allocator, yes));
+    try std.testing.expectEqual(@as(?bool, false), parseCompactionSupport(std.testing.allocator, no));
+    try std.testing.expectEqual(@as(?bool, null), parseCompactionSupport(std.testing.allocator, silent));
+    try std.testing.expectEqual(@as(?bool, null), parseCompactionSupport(std.testing.allocator, "not json"));
 }

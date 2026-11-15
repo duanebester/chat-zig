@@ -460,6 +460,51 @@ into the ring, restore `messages_total` from the highest `seq`, and restore
 > "back to chat" control while the panel is open, leaving `newConversation`
 > without a call site pending a new one (e.g. a keyboard shortcut).
 
+## Native compaction on Anthropic models
+
+> **Status: implemented.** Anthropic's [on-demand compaction](https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand)
+> (beta `compact-2026-09-04`) replaced the haiku summary on models that
+> support it. The client-side summary above is now the fallback.
+
+On-demand compaction fits this design without changing its shape: chat-zig
+still decides *when* (`TRIGGER_RATIO`) and *where* (`planCompactionCut`),
+the ring is still untouched, and the cut is still `summary_covers`. Only
+the summary changes. `ChatJob.runCompaction` sends the slice `[from, to)`,
+led by the previous block if there is one, with the chat request's own
+system prompt and `"compaction":{"type":"summarize"}`. The API answers with
+one `compaction` block (`content`, `signature`, sometimes
+`encrypted_content`) and `stop_reason` `"compaction"`. Every later request
+sends that block first in `messages`, in place of the messages before the
+cut, with the beta header. Re-compacting sends the block back with the next
+slice, and the new block subsumes it.
+
+`compaction.Summary` holds either kind: text, plus a signature when it is a
+native block. The block's `content` is a readable summary, so whenever the
+block can't be sent it is used as text exactly like a client-side summary:
+in the system prompt for a model without native compaction, as the leading
+turn of a client-side summarization, and for OpenAI.
+
+- **Support** comes from the Models API (`capabilities.compaction.summarize`),
+  asked once per model by the chat job and cached for the process
+  (`jobs.exchange.compaction_support`). An unknown answer (network error) is
+  not cached and counts as unsupported for that turn. Claude 4.5 Haiku, the
+  default model, does not support it, so it always takes the fallback;
+  Sonnet 5 and Opus 5 do.
+- **Fallback.** An unsupported model, a failed call, a 200 with no block
+  (`max_tokens`, `refusal`, ...), or a block over the caps all fall through
+  to the client-side haiku summary, and if that fails too, to the
+  uncompacted request.
+- **Limits.** A block can't be truncated, since the signature covers its
+  content, so it is refused instead: 32 KiB of content
+  (`MAX_NATIVE_SUMMARY_LEN`), 8 KiB of signature, and 32 KiB of encrypted
+  content. `anthropic.COMPACTION_MAX_TOKENS` (8192) bounds the summary at
+  about 32 KiB, which `jobs.zig` asserts at compile time. Measured live, an
+  11k-token conversation produced 8.9 KB of content and a 1.6 KB signature.
+- **Persistence.** The summary line gains `signature` and
+  `encrypted_content`, so a restored session sends the same block. A build
+  that predates this ignores both fields and uses the text as a client-side
+  summary.
+
 ## Failure behavior
 
 If the summarization request itself fails, log it, leave `summary_*`

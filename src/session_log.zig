@@ -18,6 +18,7 @@
 //!   {"seq":0,"role":"user","text":"...","file":"notes.txt"}
 //!   {"seq":1,"role":"assistant","text":"..."}
 //!   {"seq":8,"type":"summary","covers":8,"text":"..."}
+//!   {"seq":20,"type":"summary","covers":12,"text":"...","signature":"..."}
 //! `seq` is `AppState.messages_total` at the time the message was added —
 //! a monotonic counter, safe to use as a cut point even after the ring
 //! buffer (`AppState.messages`) has overwritten the message it refers to.
@@ -27,10 +28,17 @@
 //! `covers` is a `seq` too, which is exactly why a restored session can
 //! adopt the summary without re-paying for summarization — the cut it
 //! names is directly comparable to the `seq` of every message line.
+//!
+//! A summary with `signature` (and sometimes `encrypted_content`) is
+//! Anthropic's native compaction block: `text` is its `content`, and the
+//! three fields are sent back exactly as written. A build that predates
+//! native compaction ignores the extra fields and adopts `text` as a
+//! client-side summary, which still works.
 
 const std = @import("std");
 const log = std.log.scoped(.chatzig);
 const anthropic = @import("http/anthropic.zig");
+const Summary = @import("compaction.zig").Summary;
 
 pub const SESSION_DIR = "sessions";
 pub const SESSION_PATH_MAX_LEN: usize = 128;
@@ -70,8 +78,8 @@ pub const SessionLog = struct {
     /// represented by `text` rather than sent verbatim. `seq` is
     /// `messages_total` at the moment the summary was applied, so the line
     /// sorts into the transcript at the point compaction happened.
-    pub fn logSummary(self: *SessionLog, io: std.Io, seq: u64, covers: u64, text: []const u8) void {
-        self.writeSummaryLineIn(std.Io.Dir.cwd(), io, seq, covers, text);
+    pub fn logSummary(self: *SessionLog, io: std.Io, seq: u64, covers: u64, summary: *const Summary) void {
+        self.writeSummaryLineIn(std.Io.Dir.cwd(), io, seq, covers, summary);
     }
 
     /// Path of the open session file (`sessions/{unix_seconds}.jsonl`), or
@@ -182,15 +190,15 @@ pub const SessionLog = struct {
         io: std.Io,
         seq: u64,
         covers: u64,
-        text: []const u8,
+        summary: *const Summary,
     ) void {
         if (!self.ensureOpen(dir, io)) return;
         std.debug.assert(self.file != null);
-        std.debug.assert(text.len > 0);
+        std.debug.assert(!summary.isEmpty());
 
         var write_buffer: [LINE_BUFFER_LEN]u8 = undefined;
         var file_writer = self.file.?.writerStreaming(io, &write_buffer);
-        writeSummaryJsonLine(&file_writer.interface, seq, covers, text) catch |e| {
+        writeSummaryJsonLine(&file_writer.interface, seq, covers, summary) catch |e| {
             log.warn("session log: summary write failed: {t}", .{e});
             self.write_failed = true;
         };
@@ -301,6 +309,9 @@ pub const LoadedSummary = struct {
     seq: u64,
     covers: u64,
     text: []const u8,
+    /// Set on a native compaction block; borrowed like `text`.
+    signature: ?[]const u8 = null,
+    encrypted_content: ?[]const u8 = null,
 };
 
 /// A recognized line, handed to `loadSessionLines`'s callback. A union
@@ -379,6 +390,8 @@ fn dispatchLine(
         covers: ?u64 = null,
         text: ?[]const u8 = null,
         file: ?[]const u8 = null,
+        signature: ?[]const u8 = null,
+        encrypted_content: ?[]const u8 = null,
     };
 
     const parsed = std.json.parseFromSlice(LogLine, gpa, line, .{ .ignore_unknown_fields = true }) catch |e| {
@@ -398,6 +411,8 @@ fn dispatchLine(
             .seq = parsed.value.seq,
             .covers = covers,
             .text = text,
+            .signature = parsed.value.signature,
+            .encrypted_content = parsed.value.encrypted_content,
         } });
         return;
     }
@@ -454,14 +469,25 @@ fn writeSummaryJsonLine(
     writer: *std.Io.Writer,
     seq: u64,
     covers: u64,
-    text: []const u8,
+    summary: *const Summary,
 ) !void {
-    std.debug.assert(text.len > 0);
+    std.debug.assert(!summary.isEmpty());
     std.debug.assert(covers <= seq);
 
     try writer.print("{{\"seq\":{d},\"type\":\"summary\",\"covers\":{d},\"text\":\"", .{ seq, covers });
-    try anthropic.writeJsonEscapedString(writer, text);
-    try writer.writeAll("\"}\n");
+    try anthropic.writeJsonEscapedString(writer, summary.text());
+    try writer.writeByte('"');
+    if (summary.isNative()) {
+        try writer.writeAll(",\"signature\":\"");
+        try anthropic.writeJsonEscapedString(writer, summary.signature());
+        try writer.writeByte('"');
+    }
+    if (summary.encryptedContent()) |encrypted| {
+        try writer.writeAll(",\"encrypted_content\":\"");
+        try anthropic.writeJsonEscapedString(writer, encrypted);
+        try writer.writeByte('"');
+    }
+    try writer.writeAll("}\n");
     try writer.flush();
 }
 
@@ -755,10 +781,22 @@ test "loadSessionLines skips lines whose role and type are both unrecognized" {
 test "writeSummaryJsonLine formats a summary line with no role field" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeSummaryJsonLine(&w, 8, 8, "user asked about ring buffers");
+    var summary: Summary = .{};
+    try std.testing.expect(summary.setText("user asked about ring buffers"));
+    try writeSummaryJsonLine(&w, 8, 8, &summary);
     try std.testing.expectEqualStrings(
         "{\"seq\":8,\"type\":\"summary\",\"covers\":8,\"text\":\"user asked about ring buffers\"}\n",
         w.buffered(),
+    );
+
+    // A native block adds its signature and encrypted content, escaped.
+    var w2: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(summary.setNative("a \"quoted\" summary", "EuYB+/=", "opaque"));
+    try writeSummaryJsonLine(&w2, 20, 12, &summary);
+    try std.testing.expectEqualStrings(
+        "{\"seq\":20,\"type\":\"summary\",\"covers\":12,\"text\":\"a \\\"quoted\\\" summary\"," ++
+            "\"signature\":\"EuYB+/=\",\"encrypted_content\":\"opaque\"}\n",
+        w2.buffered(),
     );
 }
 
@@ -770,9 +808,15 @@ test "a logged summary round-trips through loadSessionLines" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
+    // A native block, whose content must come back byte-for-byte (the
+    // signature covers it), including characters the JSON escapes.
+    const native_text = "greeting \"exchanged\"\n\tnext: caf\xc3\xa9";
+    var summary: Summary = .{};
+    try std.testing.expect(summary.setNative(native_text, "EuYB\\sig", null));
+
     var session_log = SessionLog{};
     session_log.writeLineIn(tmp_dir.dir, io, 0, "user", "hello", null);
-    session_log.writeSummaryLineIn(tmp_dir.dir, io, 1, 1, "greeting exchanged");
+    session_log.writeSummaryLineIn(tmp_dir.dir, io, 1, 1, &summary);
     session_log.writeLineIn(tmp_dir.dir, io, 1, "assistant", "hi there", null);
     try std.testing.expect(!session_log.write_failed);
     const seconds = session_log.currentSeconds() orelse return error.TestUnexpectedResult;
@@ -793,7 +837,10 @@ test "a logged summary round-trips through loadSessionLines" {
                     .summary => |s| {
                         if (s.seq != 1) self.ok = false;
                         if (s.covers != 1) self.ok = false;
-                        if (!std.mem.eql(u8, s.text, "greeting exchanged")) self.ok = false;
+                        if (!std.mem.eql(u8, s.text, native_text)) self.ok = false;
+                        const signature = s.signature orelse "";
+                        if (!std.mem.eql(u8, signature, "EuYB\\sig")) self.ok = false;
+                        if (s.encrypted_content != null) self.ok = false;
                     },
                     .message => self.ok = false,
                 },
