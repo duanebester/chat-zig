@@ -11,21 +11,25 @@
 //! section) — filename-derived timestamp, and a badge on whichever entry
 //! is the session currently being written to.
 //!
+//! Gooey 0.4 dropped `cx.lists.uniform`; at most `MAX_SESSION_ENTRIES` (200)
+//! rows exist, so the panel is a plain keyed scroll box.
+//!
 //! There used to be a "New chat" button in the header; it's gone now that
 //! `HistoryToggle` itself doubles as "back to chat" while this panel is
 //! open, so the header is just a title, mirroring `SettingsPanel`.
 
+const std = @import("std");
 const gooey = @import("gooey");
 const Cx = gooey.Cx;
 const ui = gooey.ui;
-const Color = gooey.Color;
-const Svg = gooey.components.Svg;
-const Lucide = gooey.components.Lucide;
+const Lucide = @import("gooey-components").Lucide;
 
 const state_mod = @import("../state.zig");
 const theme_mod = @import("../theme.zig");
 const constants = @import("constants.zig");
 const date_format = @import("../date_format.zig");
+const session_log_mod = @import("../session_log.zig");
+const icon = @import("icon.zig").icon;
 
 const AppState = state_mod.AppState;
 
@@ -37,71 +41,88 @@ const TIMESTAMP_BUF_LEN = date_format.TIMESTAMP_BUF_LEN;
 pub const HistoryPanel = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
 
-        cx.render(ui.box(.{
-            .fill_width = true,
-            .padding = .{ .each = .{ .top = 4, .bottom = 12, .left = CONTENT_PADDING, .right = CONTENT_PADDING } },
-        }, .{
-            ui.text("History", .{ .color = t.text, .size = 16, .weight = .medium }),
+        cx.render(ui.box(.{ .style = .{
+            .width = .{ .grow = 1 },
+            .padding = .{ .top = 4, .bottom = 12, .left = CONTENT_PADDING, .right = CONTENT_PADDING },
+        } }, .{
+            ui.text("History", .{ .color = .text, .size = 16, .weight = .medium }),
         }));
 
         if (s.session_entry_count == 0) {
-            cx.render(ui.box(.{
-                .grow = true,
-                .fill_width = true,
-                .alignment = .{ .main = .center, .cross = .center },
-                .padding = .{ .all = CONTENT_PADDING },
-            }, .{
-                ui.text("No past sessions yet", .{ .color = t.text_secondary, .size = 13 }),
+            cx.render(ui.box(.{ .style = .{
+                .width = .{ .grow = 1 },
+                .height = .{ .grow = 1 },
+                .alignment = .center,
+                .padding = .all(CONTENT_PADDING),
+            } }, .{
+                ui.text("No past sessions yet", .{ .color = .subtext, .size = 13 }),
             }));
             return;
         }
 
-        cx.lists.uniform(
-            "history-list",
-            &s.history_list_state,
-            .{
-                .fill_width = true,
-                .grow_height = true,
-                .padding = .{ .each = .{ .top = 0, .bottom = 16, .left = CONTENT_PADDING, .right = CONTENT_PADDING } },
+        cx.render(ui.box(.{
+            .key = .{ .name = "history-list" },
+            .style = .{
+                .width = .{ .grow = 1 },
+                .height = .{ .grow = 1 },
+                .padding = .{ .bottom = 16, .left = CONTENT_PADDING, .right = CONTENT_PADDING },
                 .gap = HISTORY_ROW_GAP,
-                .background = Color.transparent,
+                .scroll = .{},
             },
-            row,
-        );
+            .a11y = .{ .role = .list, .label = "Past sessions" },
+        }, .{
+            Rows{ .count = @intCast(s.session_entry_count) },
+        }));
     }
+};
 
-    fn row(index: u32, cx: *Cx) void {
+const Rows = struct {
+    count: u32,
+
+    pub fn render(self: Rows, cx: *Cx) void {
+        std.debug.assert(self.count <= session_log_mod.MAX_SESSION_ENTRIES);
+        var index: u32 = 0;
+        while (index < self.count) : (index += 1) cx.render(Row{ .index = index });
+    }
+};
+
+const Row = struct {
+    index: u32,
+
+    pub fn render(self: Row, cx: *Cx) void {
         const s = cx.state(AppState);
         const t = theme_mod.get(s.dark_mode);
-        const entry = s.getSessionEntry(@intCast(index)) orelse return;
+        const entry = s.getSessionEntry(self.index) orelse return;
         const is_current = if (s.session_log.currentSeconds()) |cur| cur == entry.unix_seconds else false;
 
         var label_buf: [TIMESTAMP_BUF_LEN]u8 = undefined;
         const label = date_format.formatTimestamp(&label_buf, entry.unix_seconds);
 
+        // Hover is not a style field in Gooey 0.4: read it and pick a colour.
+        const key: gooey.Key = .{ .index = self.index };
+        const hovered = cx.hovered(cx.id(key));
         cx.render(ui.box(.{
-            .fill_width = true,
-            .height = HISTORY_ROW_HEIGHT,
-            .padding = .{ .symmetric = .{ .x = 14, .y = 0 } },
-            .direction = .row,
-            .alignment = .{ .main = .start, .cross = .center },
-            .gap = 10,
-            .background = t.card,
-            .border_color = if (is_current) t.primary else t.border,
-            .border_width = .{ .all = 1 },
-            .corner_radius = 10,
-            .cursor = .pointer,
-            .hover_background = t.border,
-            .on_click_handler = cx.commandWith(index, AppState.loadSession),
+            .key = key,
+            .style = .{
+                .direction = .row,
+                .width = .{ .grow = 1 },
+                .height = .{ .fixed = HISTORY_ROW_HEIGHT },
+                .padding = .symmetric(14, 0),
+                .alignment = .center_cross,
+                .gap = 10,
+                .background = .{ .rgba = if (hovered) t.border else t.card },
+                .border = .{ .width = 1, .color = .{ .rgba = if (is_current) t.primary else t.border } },
+                .corner_radius = .all(10),
+                .cursor = .pointer,
+            },
+            .on_click = cx.on(AppState.loadSession, .{ .arg = self.index }),
+            .a11y = .{ .role = .listitem, .label = label },
         }, .{
-            Svg{ .path = Lucide.message_square, .size = 16, .no_fill = true, .stroke_color = t.icon_muted, .stroke_width = 1.5 },
-            ui.box(.{ .direction = .column, .gap = 2, .grow_width = true }, .{
-                ui.text(label, .{ .color = t.text, .size = 13, .weight = .medium }),
-                ui.when(is_current, .{
-                    ui.text("Current session", .{ .color = t.primary, .size = 11 }),
-                }),
+            icon(.{ .path = Lucide.message_square, .size = 16, .stroke = .secondary }),
+            ui.box(.{ .style = .{ .width = .{ .grow = 1 }, .gap = 2 } }, .{
+                ui.text(label, .{ .color = .text, .size = 13, .weight = .medium }),
+                if (is_current) ui.text("Current session", .{ .color = .primary, .size = 11 }) else null,
             }),
         }));
     }

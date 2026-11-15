@@ -4,16 +4,20 @@
 //! - Message history
 //! - Input text binding
 //! - File attachments via native file dialog
-//! - Async API communication via `std.Io.Group` + `Io.Queue` (Zig 0.16)
+//! - Async API communication via `std.Io.concurrent` + `std.Io.Queue`
 //! - Result delivery: the render loop drains the queue each frame
 //!
-//! Zig 0.16 migration notes:
-//!   - Replaced `std.Thread.spawn` + `dispatchOnMainThread` with
-//!     `Io.async` + `Io.Queue(WorkerResult)`. Workers push typed results
-//!     into the queue; the render loop drains them without blocking.
-//!     This eliminates the per-request heap allocations (Task, Context)
-//!     and the two-hop trampoline (bg → dispatch → main) in favour of
-//!     one bounded channel.
+//! Background work under Gooey 0.5:
+//!   - Gooey runs every handler on the main thread and has no public API
+//!     for background work or for waking the event loop from another
+//!     thread. So the app keeps its own: workers start with
+//!     `io.concurrent` (never `io.async`, which may run the worker inline
+//!     on the main thread, freezing the UI and deadlocking on a full
+//!     queue) and push typed results into an `Io.Queue(WorkerResult)`.
+//!   - Nothing can wake Gooey when a result lands, so while a worker is in
+//!     flight the render function asks for another frame
+//!     (`cx.requestRenderAfter(worker_poll_ms)`) and drains the queue at
+//!     the top of each one. When no worker is running the app is idle.
 //!   - Filesystem reads, HTTP, TLS, and env lookups all thread through the
 //!     single `std.Io` instance published by `main` (via `std.process.Init`).
 //!   - The in-flight HTTP worker is tracked as a `std.Io.Future(void)` so
@@ -25,7 +29,7 @@
 const std = @import("std");
 const log = std.log.scoped(.chatzig);
 const gooey = @import("gooey");
-const file_dialog = gooey.file_dialog;
+const Effects = gooey.Effects;
 
 const anthropic = @import("http/anthropic.zig");
 const openai = @import("http/openai.zig");
@@ -33,14 +37,13 @@ const audio = @import("audio/mod.zig");
 const compaction = @import("compaction.zig");
 const session_log_mod = @import("session_log.zig");
 const SessionLog = session_log_mod.SessionLog;
-const VirtualListState = gooey.widgets.VirtualListState;
-const UniformListState = gooey.widgets.UniformListState;
-const TextAreaState = gooey.widgets.TextAreaState;
 
 // Reach back into `main` for the process-global Io + environ published from
-// `std.process.Init`. `AppState.init` needs both but only receives a `*Cx`,
-// so rather than thread them through every call we publish them on main.
+// `std.process.Init`. Gooey's `on_init` and handlers receive only the state
+// and `Effects`, so `main` publishes both before `App.main` runs.
 const main_mod = @import("main.zig");
+const theme_mod = @import("theme.zig");
+const WidthProbe = @import("components/width_probe.zig").WidthProbe;
 
 // =============================================================================
 // Constants (CLAUDE rule #4: put a limit on everything)
@@ -49,7 +52,6 @@ const main_mod = @import("main.zig");
 pub const MAX_MESSAGES: usize = 256;
 pub const MAX_MESSAGE_LEN: usize = 32768;
 pub const MAX_INPUT_LEN: usize = 4096;
-pub const DEFAULT_MESSAGE_HEIGHT: f32 = 60.0;
 pub const MAX_RESPONSE_LEN: usize = 32768;
 pub const MAX_FILE_PATH_LEN: usize = 512;
 pub const MAX_ATTACHED_FILENAME_LEN: usize = 128;
@@ -62,11 +64,21 @@ pub const MAX_ATTACHED_FILENAME_LEN: usize = 128;
 pub const RESULT_QUEUE_CAPACITY: usize = 8;
 pub const RECORDING_PATH_MAX_LEN: usize = 128;
 
-/// Row height for the history panel's uniform list (see `HistoryPanel`).
-/// Lives here, next to `DEFAULT_MESSAGE_HEIGHT`, because both size a list
-/// state that `AppState` owns and must initialize up front.
+/// How often the render loop polls `result_queue` while a worker is in
+/// flight (about 30 Hz). Gooey has no thread-safe wake-up, so this is the
+/// latency between a streamed delta landing and the frame that shows it.
+pub const WORKER_POLL_MS: u32 = 33;
+
+/// Row height and gap for the history panel's session list.
 pub const HISTORY_ROW_HEIGHT: f32 = 56.0;
 pub const HISTORY_ROW_GAP: f32 = 8.0;
+
+/// Extensions the attachment path understands: images (base64), text files
+/// (inline), and PDFs (Files API). Gooey's file dialog has no type filter,
+/// so `fileChosen` checks the pick against this list instead.
+const ATTACHABLE_EXTENSIONS = [_][]const u8{
+    "txt", "md", "json", "csv", "png", "jpg", "jpeg", "gif", "webp", "pdf",
+};
 
 const CHAT_SYSTEM_INSTRUCTION =
     "Respond in plain text only. Do not use Markdown or other markup. " ++
@@ -81,8 +93,8 @@ const DEFAULT_DEVICE_MARKER = "\xe2\x97\x8f ";
 //
 // Compaction never mutates `messages`. The ring stays the UI transcript;
 // the summary is a derived cache that only affects *request assembly*, so
-// `streaming_message_idx`, every `cached_height`, and `list_state`'s item
-// count all stay valid across a compaction. Failure is therefore free:
+// `streaming_message_idx` and the transcript's rendered order stay valid
+// across a compaction. Failure is therefore free:
 // leave `summary_len` alone and the next request is simply the
 // uncompacted one.
 //
@@ -217,19 +229,19 @@ pub const Model = enum(u8) {
     };
 
     pub fn displayName(self: Model) []const u8 {
-        return display_names[@intFromEnum(self)];
+        return display_names[@backingInt(self)];
     }
 
     pub fn apiName(self: Model) []const u8 {
-        return api_names[@intFromEnum(self)];
+        return api_names[@backingInt(self)];
     }
 
     pub fn provider(self: Model) ModelProvider {
-        return providers[@intFromEnum(self)];
+        return providers[@backingInt(self)];
     }
 
     pub fn contextWindowTokens(self: Model) u32 {
-        return context_window_tokens[@intFromEnum(self)];
+        return context_window_tokens[@backingInt(self)];
     }
 };
 
@@ -261,11 +273,11 @@ pub const DictationModel = enum(u8) {
     };
 
     pub fn displayName(self: DictationModel) []const u8 {
-        return display_names[@intFromEnum(self)];
+        return display_names[@backingInt(self)];
     }
 
     pub fn apiName(self: DictationModel) []const u8 {
-        return api_names[@intFromEnum(self)];
+        return api_names[@backingInt(self)];
     }
 };
 
@@ -296,7 +308,6 @@ pub const Message = struct {
     /// Optional attached file name (just the filename, not full path).
     attached_file: [MAX_ATTACHED_FILENAME_LEN]u8 = undefined,
     attached_file_len: usize = 0,
-    cached_height: f32 = 0.0,
 
     pub fn getText(self: *const Message) []const u8 {
         return self.content[0..self.content_len];
@@ -315,7 +326,6 @@ pub const Message = struct {
         const len = @min(text.len, MAX_MESSAGE_LEN);
         @memcpy(msg.content[0..len], text[0..len]);
         msg.content_len = len;
-        msg.cached_height = 0.0;
         return msg;
     }
 
@@ -327,7 +337,6 @@ pub const Message = struct {
         const fname_len = @min(filename.len, MAX_ATTACHED_FILENAME_LEN);
         @memcpy(msg.attached_file[0..fname_len], filename[0..fname_len]);
         msg.attached_file_len = fname_len;
-        msg.cached_height = 0.0;
         return msg;
     }
 
@@ -336,7 +345,6 @@ pub const Message = struct {
         const len = @min(text.len, MAX_MESSAGE_LEN);
         @memcpy(msg.content[0..len], text[0..len]);
         msg.content_len = len;
-        msg.cached_height = 0.0;
         return msg;
     }
 };
@@ -445,6 +453,9 @@ pub const TranscriptionErrorResult = struct {
 // AppState
 // =============================================================================
 
+/// The settings panel's dropdowns, for `AppState.open_select`.
+pub const SelectId = enum(u8) { model, dictation_model, microphone };
+
 pub const AppState = struct {
     const Self = @This();
 
@@ -504,11 +515,6 @@ pub const AppState = struct {
     // =========================================================================
     // UI State
     // =========================================================================
-    list_state: VirtualListState = VirtualListState.initWithGap(0, DEFAULT_MESSAGE_HEIGHT, 8),
-    /// Backs the history panel's session list (see `HistoryPanel`). Rows are
-    /// uniform height, unlike `list_state`'s variable-height messages, so
-    /// this uses `UniformListState` rather than a second `VirtualListState`.
-    history_list_state: UniformListState = UniformListState.initWithGap(0, HISTORY_ROW_HEIGHT, HISTORY_ROW_GAP),
     is_loading: bool = false,
     has_api_key: bool = false,
     has_openai_api_key: bool = false,
@@ -523,6 +529,19 @@ pub const AppState = struct {
     /// of past sessions) instead of `ContentArea`'s message list. Mutually
     /// exclusive with `settings_expanded` — see `toggleHistory`.
     history_expanded: bool = false,
+    /// Which settings dropdown has its menu open. Gooey 0.4's `Select` is
+    /// controlled: the app owns the open flag and closes it on a pick or a
+    /// click outside.
+    open_select: ?SelectId = null,
+    /// Width of the composer card's text row, measured by a probe painted
+    /// in the last frame (see `InputArea`). Gooey's `TextArea` takes a fixed
+    /// width, and render has no window size, so this is how the input
+    /// follows the window. 500 px window minus the column and card padding.
+    composer_width: f32 = 426,
+    /// The `composer_width` the last build used.
+    composer_width_used: f32 = 426,
+    /// The probe's paint data; it must outlive the build that emits it.
+    composer_probe: WidthProbe = .{},
 
     selected_model: Model = .haiku,
     selected_dictation_model: DictationModel = .gpt4o_mini_transcribe,
@@ -632,36 +651,20 @@ pub const AppState = struct {
     result_queue: std.Io.Queue(WorkerResult) = undefined,
 
     // =========================================================================
-    // Framework handles
-    // =========================================================================
-    //
-    // `window_ptr` is retained so workers can nudge the event loop via
-    // `requestRender()`. That call is threadsafe by contract and does not touch
-    // shared state; it only wakes the run loop so the next frame drains the queue.
-    window_ptr: ?*gooey.Window = null,
-
-    // =========================================================================
     // Initialization
     // =========================================================================
 
-    pub fn init(cx: *gooey.Cx) void {
-        const self = cx.state(Self);
-        const window = cx.window();
-        self.window_ptr = window;
-
-        // Set initial window appearance from the persisted dark_mode flag.
-        window.setAppearance(self.dark_mode);
-
+    /// Gooey's `on_init`: runs once, on the state at its final address,
+    /// before the first frame.
+    pub fn init(self: *Self, _: *Effects) void {
         // Wire up the async plumbing. The queue is built in place; its
-        // backing buffer already lives at its final address on AppState (we
-        // are past the stack→heap move because `init` is called on the
-        // mounted, committed state pointer).
+        // backing buffer lives on AppState, which `gooey.App` allocates once
+        // and never moves.
         //
         // No cancel-group registration: chat-zig is single-flight (one
         // worker at most) and we track that one worker's `Future`
-        // directly on AppState. On window close the OS reaps the
-        // process; AppState is module-static so there is no teardown
-        // for a stray worker to race against.
+        // directly on AppState. Gooey has no shutdown hook, so a worker
+        // still in flight when the window closes is reaped with the process.
         self.result_queue = std.Io.Queue(WorkerResult).init(&self.result_buffer);
         self.microphone.refresh();
 
@@ -729,21 +732,6 @@ pub const AppState = struct {
             self.message_head = (self.message_head + 1) % MAX_MESSAGES;
         }
 
-        // Freshly-added messages start with no cached height. Being explicit
-        // here guards against a caller constructing `msg` with a stale value.
-        const tail_idx = if (self.message_count == 0)
-            self.message_head
-        else
-            (self.message_head + self.message_count - 1) % MAX_MESSAGES;
-        self.messages[tail_idx].cached_height = 0.0;
-
-        // Keep the virtual list in sync with the message ring, and scroll so
-        // the freshly-added message is visible. These are UI-side mutations
-        // that live on the same thread as the caller (main thread — callers
-        // are either `sendMessage` or the render-loop drain).
-        self.list_state.setItemCount(@intCast(self.message_count));
-        self.list_state.scrollToBottom();
-
         return seq;
     }
 
@@ -754,35 +742,11 @@ pub const AppState = struct {
         return &self.messages[idx];
     }
 
-    pub fn getMessageCachedHeight(self: *const Self, i: usize) f32 {
-        if (i >= self.message_count) return 0.0;
-        std.debug.assert(i < MAX_MESSAGES);
-        const idx = (self.message_head + i) % MAX_MESSAGES;
-        return self.messages[idx].cached_height;
-    }
-
-    pub fn setMessageCachedHeight(self: *Self, i: usize, h: f32) void {
-        if (i >= self.message_count) return;
-        std.debug.assert(i < MAX_MESSAGES);
-        const idx = (self.message_head + i) % MAX_MESSAGES;
-        self.messages[idx].cached_height = h;
-    }
-
-    pub fn invalidateCachedHeights(self: *Self) void {
-        var i: usize = 0;
-        while (i < self.message_count) : (i += 1) {
-            const idx = (self.message_head + i) % MAX_MESSAGES;
-            self.messages[idx].cached_height = 0.0;
-        }
-    }
-
     pub fn clearMessages(self: *Self) void {
         self.message_count = 0;
         self.message_head = 0;
         self.error_message = null;
         self.is_loading = false;
-        self.list_state.setItemCount(0);
-        self.list_state.scrollToTop();
     }
 
     // =========================================================================
@@ -982,12 +946,16 @@ pub const AppState = struct {
     }
 
     // =========================================================================
-    // Send Message — launches an async worker via Io.Group
+    // Send Message — launches a concurrent worker on the shared Io
     // =========================================================================
 
-    pub fn sendMessage(self: *Self, window: *gooey.Window) void {
-        self.window_ptr = window;
+    /// Whether a worker may push into `result_queue`, so the render loop
+    /// must keep polling it (see `WORKER_POLL_MS`).
+    pub fn workerInFlight(self: *const Self) bool {
+        return self.pending_request != null or self.pending_transcription != null;
+    }
 
+    pub fn sendMessage(self: *Self) void {
         if (self.input_slice.len == 0) return;
         // Single-flight: swallow a second click while the first request is
         // still outstanding. This is also what keeps the worker's snapshot
@@ -1034,11 +1002,9 @@ pub const AppState = struct {
 
         self.pending_file_path_len = attached_path_len;
 
-        // Clear input + attachment from the UI.
+        // Clear input + attachment from the UI. The `TextArea` bound to
+        // `input_slice` adopts the empty value on the next build.
         self.input_slice = "";
-        if (window.widgetState(TextAreaState, "chat-input")) |text_area| {
-            text_area.clear();
-        }
         self.has_attached_file = false;
         self.attached_file_path_len = 0;
 
@@ -1050,19 +1016,20 @@ pub const AppState = struct {
             .anthropic => if (self.http_client == null) {
                 self.error_message = "No Anthropic API key configured";
                 self.is_loading = false;
-                window.requestRender();
                 return;
             },
             .openai => if (self.openai_client == null) {
                 self.error_message = "No OpenAI API key configured";
                 self.is_loading = false;
-                window.requestRender();
                 return;
             },
         }
 
-        // Launch the worker on the shared Io instance. `io.async` returns
-        // a `Future(void)` that we stash on `pending_request` so the Stop
+        // Launch the worker on the shared Io instance. `io.concurrent`
+        // guarantees the worker runs beside the main thread; `io.async` may
+        // run it inline, which would block the UI for the whole request and
+        // deadlock once the bounded queue fills. It returns a `Future(void)`
+        // that we stash on `pending_request` so the Stop
         // button can cancel exactly this one task. Worker functions take
         // only primitives + pointers, never a `self`-style receiver, so
         // the Io runtime can cache arguments in registers (CLAUDE rule
@@ -1076,22 +1043,26 @@ pub const AppState = struct {
         std.debug.assert(self.pending_request == null);
 
         const io = main_mod.process_io;
-        self.pending_request = switch (provider) {
-            .anthropic => io.async(httpWorker, .{
+        const launched = switch (provider) {
+            .anthropic => io.concurrent(httpWorker, .{
                 io,
                 &self.http_client.?,
                 self,
                 &self.result_queue,
             }),
-            .openai => io.async(openaiChatWorker, .{
+            .openai => io.concurrent(openaiChatWorker, .{
                 io,
                 &self.openai_client.?,
                 self,
                 &self.result_queue,
             }),
         };
-
-        window.requestRender();
+        self.pending_request = launched catch |err| {
+            log.err("sendMessage: cannot start the request worker: {t}", .{err});
+            self.error_message = "Could not start the request (no thread available)";
+            self.is_loading = false;
+            return;
+        };
     }
 
     // =========================================================================
@@ -1124,7 +1095,7 @@ pub const AppState = struct {
     ///      `streaming_message_idx = null`, `error_message = null`. The
     ///      partial assistant bubble stays in the message history; the
     ///      user can see what they got before stopping.
-    pub fn cancelInFlight(self: *Self, window: *gooey.Window) void {
+    pub fn cancelInFlight(self: *Self) void {
         if (self.pending_request == null) return;
         std.debug.assert(self.is_loading);
 
@@ -1156,7 +1127,6 @@ pub const AppState = struct {
         self.error_message = null;
 
         log.info("Streaming request cancelled by user", .{});
-        window.requestRender();
     }
 
     // =========================================================================
@@ -1217,9 +1187,6 @@ pub const AppState = struct {
             log.debug("onStreamDelta: queue closed ({t}), aborting", .{e});
             return error.Aborted;
         };
-
-        // Nudge the run loop. `requestRender` is threadsafe by contract.
-        app.requestRenderFromWorker();
     }
 
     // =========================================================================
@@ -1359,7 +1326,6 @@ pub const AppState = struct {
         } }) catch |e| {
             log.debug("runCompaction: compaction result dropped ({t})", .{e});
         };
-        app.requestRenderFromWorker();
 
         return .{ .summary = app.pending_summary_buf[0..len], .covers = cut.covers };
     }
@@ -1481,8 +1447,6 @@ pub const AppState = struct {
             // tearing down, drop the result.
             log.debug("httpWorker: terminal result dropped ({t})", .{e});
         };
-
-        app.requestRenderFromWorker();
     }
 
     /// SSE sink callback for OpenAI streaming chat — mirrors `onStreamDelta`
@@ -1512,8 +1476,6 @@ pub const AppState = struct {
             log.debug("onOpenAIStreamDelta: queue closed ({t}), aborting", .{e});
             return error.Aborted;
         };
-
-        app.requestRenderFromWorker();
     }
 
     /// Chat worker for OpenAI models (see `Model.provider`) — mirrors
@@ -1552,8 +1514,6 @@ pub const AppState = struct {
         queue.putOne(io, outcome) catch |e| {
             log.debug("openaiChatWorker: terminal result dropped ({t})", .{e});
         };
-
-        app.requestRenderFromWorker();
     }
 
     /// Transcribes a just-finished recording via the user's selected
@@ -1593,17 +1553,6 @@ pub const AppState = struct {
         queue.putOne(io, outcome) catch |e| {
             log.debug("transcriptionWorker: terminal result dropped ({t})", .{e});
         };
-
-        app.requestRenderFromWorker();
-    }
-
-    /// Request a render from a worker fiber. Safe to call from any thread —
-    /// `Gooey.requestRender` is threadsafe by contract and only nudges the
-    /// event loop; the actual result delivery still flows through the
-    /// Io.Queue drain on the main thread.
-    fn requestRenderFromWorker(self: *Self) void {
-        const window = self.window_ptr orelse return;
-        window.requestRender();
     }
 
     // =========================================================================
@@ -1617,18 +1566,22 @@ pub const AppState = struct {
     /// Non-blocking: returns immediately if the queue is empty. The internal
     /// buffer is sized to match `RESULT_QUEUE_CAPACITY` so a single drain
     /// cannot leave backlog.
-    pub fn drainResults(self: *Self, cx: *gooey.Cx) void {
+    pub fn drainResults(self: *Self) void {
+        if (!self.workerInFlight()) return;
         var buf: [RESULT_QUEUE_CAPACITY]WorkerResult = undefined;
-        const drained = cx.drainQueue(WorkerResult, &self.result_queue, &buf);
-        std.debug.assert(drained.len <= RESULT_QUEUE_CAPACITY);
-        const window = cx.window();
-        for (drained) |r| {
+        // `min = 0` never blocks. The queue is never closed and this is not
+        // a cancelable task, so an error here is a programmer error.
+        const count = self.result_queue.get(main_mod.process_io, &buf, 0) catch |err| {
+            std.debug.panic("drainResults: result queue failed: {t}", .{err});
+        };
+        std.debug.assert(count <= RESULT_QUEUE_CAPACITY);
+        for (buf[0..count]) |r| {
             switch (r) {
                 .chat_delta => |d| self.applyChatDelta(d),
                 .chat_success => |ok| self.applyChatSuccess(ok),
                 .chat_error => |err| self.applyChatError(err),
                 .compaction_applied => |c| self.applyCompactionApplied(c),
-                .transcription_success => |ok| self.applyTranscriptionSuccess(ok, window),
+                .transcription_success => |ok| self.applyTranscriptionSuccess(ok),
                 .transcription_error => |err| self.applyTranscriptionError(err),
             }
         }
@@ -1636,16 +1589,13 @@ pub const AppState = struct {
 
     /// Apply one streaming delta. Lazily creates an empty assistant
     /// `Message` on the first delta of a stream, then grows it in-place
-    /// for every subsequent delta. The cached layout height is
-    /// invalidated each time so the virtual list re-measures the
-    /// growing bubble on the next frame.
+    /// for every subsequent delta.
     fn applyChatDelta(self: *Self, d: DeltaResult) void {
         std.debug.assert(d.cumulative_len <= MAX_RESPONSE_LEN);
         std.debug.assert(self.is_loading);
 
         // First delta: append the placeholder assistant message and
-        // remember its index. `addMessage` does the virtual-list /
-        // scroll bookkeeping; we just have to capture the index *after*
+        // remember its index. We have to capture the index *after*
         // the message is appended (so it survives any future overwrites
         // — which can't happen during a single stream, but the
         // assertion below pins the invariant either way).
@@ -1658,7 +1608,6 @@ pub const AppState = struct {
 
         const idx = self.streaming_message_idx.?;
         std.debug.assert(idx < self.message_count);
-        const follow_stream = self.list_state.isScrolledToBottom(2.0);
 
         // Compute the slot in the underlying ring and grow the message in
         // place. Worker only appends, so `cumulative_len` only goes up;
@@ -1675,15 +1624,6 @@ pub const AppState = struct {
             self.pending_response_buf[0..cap],
         );
         self.messages[ring_idx].content_len = cap;
-        // Invalidate cached height — the bubble just grew. The virtual
-        // list will re-measure on the next render pass.
-        self.messages[ring_idx].cached_height = 0.0;
-
-        // Follow new content only while the viewport was already at the end.
-        // Once the user scrolls upward, streamed deltas preserve that position.
-        if (follow_stream) {
-            self.list_state.scrollToBottom();
-        }
     }
 
     /// Await and clear the in-flight worker `Future`. Idempotent — safe
@@ -1828,12 +1768,10 @@ pub const AppState = struct {
     }
 
     /// Drops the transcribed text into the chat input box, replacing
-    /// whatever was there. Updates both the bound model (`input_slice`,
-    /// backed by the fixed `input_text` buffer — no heap allocation) and
-    /// the live widget directly, so the change is visible this frame
-    /// rather than lagging one frame behind the next `syncBoundText`
-    /// reconciliation. Mirrors the clear-on-send pattern in `sendMessage`.
-    fn applyTranscriptionSuccess(self: *Self, r: TranscriptionSuccessResult, window: *gooey.Window) void {
+    /// whatever was there. Updates the bound model (`input_slice`, backed by
+    /// the fixed `input_text` buffer — no heap allocation); the drain runs
+    /// at the top of render, so the `TextArea` adopts it in the same build.
+    fn applyTranscriptionSuccess(self: *Self, r: TranscriptionSuccessResult) void {
         std.debug.assert(r.text_len > 0);
         std.debug.assert(r.text_len <= MAX_INPUT_LEN);
 
@@ -1845,10 +1783,6 @@ pub const AppState = struct {
         std.debug.assert(text_len <= self.pending_transcript_buf.len);
         @memcpy(self.input_text[0..text_len], self.pending_transcript_buf[0..text_len]);
         self.input_slice = self.input_text[0..text_len];
-
-        if (window.widgetState(TextAreaState, "chat-input")) |text_area| {
-            text_area.setText(self.input_slice) catch {};
-        }
     }
 
     fn applyTranscriptionError(self: *Self, e: TranscriptionErrorResult) void {
@@ -1861,21 +1795,22 @@ pub const AppState = struct {
     // Theme / Model Toggles
     // =========================================================================
 
-    pub fn toggleDarkMode(self: *Self, window: *gooey.Window) void {
+    /// Flips the palette. Gooey's stock components (`TextArea`, `Select`)
+    /// read theme tokens, so the matching `gooey.Theme` goes with it.
+    pub fn toggleDarkMode(self: *Self, effects: *Effects) void {
         self.dark_mode = !self.dark_mode;
-        window.setAppearance(self.dark_mode);
-        window.requestRender();
+        effects.setTheme(theme_mod.gooeyFor(self.dark_mode));
     }
 
     /// Toggles the settings view. Mutually exclusive with the history view
     /// (`history_expanded`) — opening settings closes history, since both
     /// take over the content area in place of `ContentArea`.
-    pub fn toggleSettings(self: *Self, window: *gooey.Window) void {
+    pub fn toggleSettings(self: *Self) void {
         std.debug.assert(self.microphone.devices.count <= audio.MAX_INPUT_DEVICES);
         std.debug.assert(self.message_count <= MAX_MESSAGES);
         self.settings_expanded = !self.settings_expanded;
         if (self.settings_expanded) self.history_expanded = false;
-        window.requestRender();
+        self.open_select = null;
     }
 
     /// Toggles the history panel. Opening it re-scans `sessions/*.jsonl`
@@ -1883,29 +1818,22 @@ pub const AppState = struct {
     /// written since it was last opened; closing it leaves the last scan in
     /// place rather than clearing it, since re-opening will just rescan.
     /// Mutually exclusive with the settings view — see `toggleSettings`.
-    pub fn toggleHistory(self: *Self, window: *gooey.Window) void {
+    pub fn toggleHistory(self: *Self) void {
         std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
         self.history_expanded = !self.history_expanded;
         if (self.history_expanded) self.settings_expanded = false;
         if (self.history_expanded) self.refreshSessionHistory();
-        if (self.history_expanded) {
-            std.debug.assert(self.history_list_state.item_count == @as(u32, @intCast(self.session_entry_count)));
-        }
-        window.requestRender();
+        self.open_select = null;
     }
 
     /// Scans `sessions/*.jsonl` (via `session_log.listSessions`) into
-    /// `session_entries`, newest first, and syncs `history_list_state` so
-    /// the panel's uniform list has the right item count.
+    /// `session_entries`, newest first.
     fn refreshSessionHistory(self: *Self) void {
         std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
 
         const io = main_mod.process_io;
         self.session_entry_count = session_log_mod.listSessions(std.Io.Dir.cwd(), io, &self.session_entries);
         std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
-
-        self.history_list_state.setItemCount(@intCast(self.session_entry_count));
-        self.history_list_state.scrollToTop();
     }
 
     /// Bounded-checked accessor for `session_entries`, mirroring `getMessage`.
@@ -1923,12 +1851,12 @@ pub const AppState = struct {
     /// JSONL file — not the current `SessionLog`, which keeps writing to
     /// this process's own file unaffected: any turns sent after a restore
     /// extend it, continuing from the restored `messages_total`.
-    pub fn loadSession(self: *Self, window: *gooey.Window, index: u32) void {
+    pub fn loadSession(self: *Self, index: u32) void {
         std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
         const entry = self.getSessionEntry(index) orelse return;
         std.debug.assert(entry.unix_seconds > 0);
 
-        self.cancelInFlight(window);
+        self.cancelInFlight();
         self.clearMessages();
         self.clearCompaction();
 
@@ -2008,9 +1936,7 @@ pub const AppState = struct {
         if (self.summary_covers > self.messages_total) self.clearCompaction();
         if (self.summary_len == 0) std.debug.assert(self.summary_covers == 0);
 
-        self.invalidateCachedHeights();
         self.history_expanded = false;
-        window.requestRender();
     }
 
     /// Starts a brand new conversation: cancels any in-flight request,
@@ -2027,46 +1953,57 @@ pub const AppState = struct {
     /// "New chat" button once `HistoryToggle` started doubling as a "back
     /// to chat" affordance. Kept for a future call site (e.g. a keyboard
     /// shortcut) rather than deleted outright.
-    pub fn newConversation(self: *Self, window: *gooey.Window) void {
+    pub fn newConversation(self: *Self) void {
         std.debug.assert(self.session_entry_count <= session_log_mod.MAX_SESSION_ENTRIES);
 
-        self.cancelInFlight(window);
+        self.cancelInFlight();
         self.clearMessages();
 
         self.session_log.startNew(main_mod.process_io);
         self.messages_total = 0;
         self.clearCompaction();
 
-        self.invalidateCachedHeights();
         self.history_expanded = false;
         std.debug.assert(self.message_count == 0);
-        window.requestRender();
     }
 
-    pub fn selectModel(self: *Self, index: usize) void {
-        self.selected_model = @enumFromInt(index);
+    pub fn selectModel(self: *Self, index: u32) void {
+        std.debug.assert(index < MODEL_COUNT);
+        self.selected_model = @fromBackingInt(@intCast(index));
+        self.open_select = null;
     }
 
-    pub fn selectDictationModel(self: *Self, index: usize) void {
+    pub fn selectDictationModel(self: *Self, index: u32) void {
         std.debug.assert(index < DICTATION_MODEL_COUNT);
         std.debug.assert(index < DictationModel.api_names.len);
-        self.selected_dictation_model = @enumFromInt(index);
+        self.selected_dictation_model = @fromBackingInt(@intCast(index));
+        self.open_select = null;
     }
 
-    pub fn selectMicrophone(self: *Self, index: usize) void {
+    pub fn selectMicrophone(self: *Self, index: u32) void {
         std.debug.assert(index < self.microphone.devices.count);
         std.debug.assert(index < audio.MAX_INPUT_DEVICES);
         self.microphone.selected = index;
+        self.open_select = null;
     }
 
-    pub fn refreshMicrophones(self: *Self, window: *gooey.Window) void {
+    /// `Select.on_toggle`: opens `select`'s menu, closing any other.
+    pub fn toggleSelect(self: *Self, select: SelectId) void {
+        self.open_select = if (self.open_select == select) null else select;
+    }
+
+    /// `Select.on_close`: a click outside the open menu, or Escape.
+    pub fn closeSelect(self: *Self, select: SelectId) void {
+        if (self.open_select == select) self.open_select = null;
+    }
+
+    pub fn refreshMicrophones(self: *Self) void {
         std.debug.assert(self.microphone.devices.count <= audio.MAX_INPUT_DEVICES);
         std.debug.assert(!self.recording.active);
         self.microphone.refresh();
-        window.requestRender();
     }
 
-    pub fn toggleRecording(self: *Self, window: *gooey.Window) void {
+    pub fn toggleRecording(self: *Self) void {
         std.debug.assert(self.microphone.devices.count <= audio.MAX_INPUT_DEVICES);
         std.debug.assert(self.recording.path_len <= RECORDING_PATH_MAX_LEN);
 
@@ -2074,11 +2011,10 @@ pub const AppState = struct {
             self.recording.active = false;
             if (audio.stopRecording()) |_| {
                 self.recording.last_error = null;
-                self.startTranscription(window);
+                self.startTranscription();
             } else |capture_error| {
                 self.recording.last_error = capture_error;
             }
-            window.requestRender();
             return;
         }
 
@@ -2098,7 +2034,6 @@ pub const AppState = struct {
 
         self.recording.last_error = null;
         self.recording.active = true;
-        window.requestRender();
     }
 
     /// Kicks off background transcription of the just-finished recording
@@ -2115,7 +2050,7 @@ pub const AppState = struct {
     /// transcription is in flight — see `can_record` in `layout.zig`, and
     /// `is_transcribing` closes that window, but the copy is cheap
     /// insurance against future UI changes reopening it).
-    fn startTranscription(self: *Self, window: *gooey.Window) void {
+    fn startTranscription(self: *Self) void {
         std.debug.assert(!self.is_transcribing);
         std.debug.assert(self.pending_transcription == null);
 
@@ -2126,12 +2061,8 @@ pub const AppState = struct {
         const path_len = self.recording.path_len;
         @memcpy(path_buf[0..path_len], self.recording.path());
 
-        self.is_transcribing = true;
-        self.error_message = null;
-        self.window_ptr = window;
-
         const io = main_mod.process_io;
-        self.pending_transcription = io.async(transcriptionWorker, .{
+        self.pending_transcription = io.concurrent(transcriptionWorker, .{
             io,
             &self.openai_client.?,
             self,
@@ -2139,9 +2070,13 @@ pub const AppState = struct {
             path_buf,
             path_len,
             self.selected_dictation_model,
-        });
-
-        window.requestRender();
+        }) catch |err| {
+            log.err("startTranscription: cannot start the worker: {t}", .{err});
+            self.error_message = "Could not start transcription (no thread available)";
+            return;
+        };
+        self.is_transcribing = true;
+        self.error_message = null;
     }
 
     pub fn microphoneLevels(_: *const Self) [audio.WAVEFORM_BAR_COUNT]f32 {
@@ -2156,39 +2091,56 @@ pub const AppState = struct {
     // File Attachment Handlers
     // =========================================================================
 
-    pub fn openFileDialog(self: *Self, window: *gooey.Window) void {
-        _ = self;
-        // Defer to avoid deadlock — the native file dialog blocks and
-        // processes events, which can re-enter input handlers while the
-        // render mutex is held.
-        window.deferCommand(Self.openFileDialogDeferred);
+    /// Asks Gooey for the native open dialog; the pick arrives in
+    /// `fileChosen` on a later drain, on the main thread.
+    pub fn openFileDialog(_: *Self, effects: *Effects) void {
+        effects.openFileDialog(.{
+            .kind = .{ .open = .{ .files = true, .directories = false, .multiple = false } },
+            .on_complete = effects.handler(Self.fileChosen),
+        });
     }
 
-    fn openFileDialogDeferred(self: *Self, _: *gooey.Window) void {
-        if (file_dialog.promptForPaths(std.heap.page_allocator, .{
-            .files = true,
-            .directories = false,
-            .multiple = false,
-            .prompt = "Attach",
-            .message = "Select a file to attach",
-            // Supported file types: images (base64), text files (inline), PDFs (Files API).
-            .allowed_extensions = &.{ "txt", "md", "json", "csv", "png", "jpg", "jpeg", "gif", "webp", "pdf" },
-        })) |result| {
-            defer result.deinit();
-            if (result.paths.len > 0) {
-                const path = result.paths[0];
-                const len = @min(path.len, MAX_FILE_PATH_LEN);
-                @memcpy(self.attached_file_path[0..len], path[0..len]);
-                self.attached_file_path_len = len;
-                self.has_attached_file = true;
-                log.info("File attached: {s}", .{self.getAttachedFilePath()});
-            }
-        } else {
-            log.debug("File dialog cancelled", .{});
+    pub fn fileChosen(self: *Self, effects: *Effects) void {
+        const completion = effects.completionEvent().?;
+        switch (completion.outcome) {
+            .file_selected => |paths| self.attachFile(paths.first()),
+            .cancelled => log.debug("File dialog cancelled", .{}),
+            .failed => |err| {
+                log.warn("File dialog failed: {t}", .{err});
+                self.error_message = "The file dialog failed to open";
+            },
         }
     }
 
-    pub fn clearAttachedFile(self: *Self, _: *gooey.Window) void {
+    /// Stages `path` as the next message's attachment, if the request
+    /// builders understand its type and the path fits.
+    fn attachFile(self: *Self, path: []const u8) void {
+        std.debug.assert(path.len > 0);
+        if (path.len > MAX_FILE_PATH_LEN) {
+            self.error_message = "That file's path is too long to attach";
+            return;
+        }
+        if (!isAttachable(path)) {
+            self.error_message = "Attach a text, Markdown, JSON, CSV, image, or PDF file";
+            return;
+        }
+        @memcpy(self.attached_file_path[0..path.len], path);
+        self.attached_file_path_len = path.len;
+        self.has_attached_file = true;
+        self.error_message = null;
+        log.info("File attached: {s}", .{self.getAttachedFilePath()});
+    }
+
+    fn isAttachable(path: []const u8) bool {
+        const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return false;
+        const extension = path[dot + 1 ..];
+        for (ATTACHABLE_EXTENSIONS) |allowed| {
+            if (std.ascii.eqlIgnoreCase(extension, allowed)) return true;
+        }
+        return false;
+    }
+
+    pub fn clearAttachedFile(self: *Self) void {
         self.has_attached_file = false;
         self.attached_file_path_len = 0;
     }

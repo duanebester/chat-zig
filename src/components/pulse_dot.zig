@@ -5,31 +5,30 @@
 //! `content_area.zig`. Once deltas start landing the growing text is its own
 //! progress indicator, so the dot goes away.
 //!
-//! The dot owns its tween rather than taking progress from a parent: there
-//! is exactly one animation to drive, and `Window.endFrame` keeps requesting
-//! frames on its own while any tween is running, so callers don't have to
-//! pump it.
+//! Gooey 0.4's animation helpers (`tween`, `tweenOn`, `motion`) play once
+//! or spring to a target; none loops. So the dot reads the clock and asks
+//! for its next frame itself (`cx.requestRenderAfter`) while it is on screen.
 
 const std = @import("std");
 const gooey = @import("gooey");
 const Cx = gooey.Cx;
 const ui = gooey.ui;
 const Color = gooey.Color;
-const Easing = gooey.animation.Easing;
+
+const main_mod = @import("../main.zig");
 
 /// Scale and opacity at the bottom of the breath. Neither bottoms out at
 /// zero — a dot that fully vanishes reads as a flicker rather than a pulse.
 const SCALE_MIN: f32 = 0.6;
 const OPACITY_MIN: f32 = 0.3;
 
-/// Default breath period. Exported because `thinking_shader.zig` matches it,
-/// so the window's rim glow and this dot move at the same tempo.
+/// Default breath period.
 pub const PERIOD_MS_DEFAULT: u32 = 1200;
 
+/// About 30 frames per second is smooth for an 8 px dot.
+const FRAME_MS: u32 = 33;
+
 pub const PulseDot = struct {
-    /// Animation key. Distinct per instance, so two dots on screen don't
-    /// share one tween and pulse in lockstep.
-    id: []const u8,
     color: Color,
     size: f32 = 8,
     period_ms: u32 = PERIOD_MS_DEFAULT,
@@ -38,38 +37,38 @@ pub const PulseDot = struct {
         std.debug.assert(self.size > 0.0);
         std.debug.assert(self.period_ms > 0);
 
-        // Linear loop, folded into a triangle wave below. Easing the tween
-        // itself would make the fold discontinuous at the turnaround.
-        const pulse = cx.animations.tween(self.id, .{
-            .duration_ms = self.period_ms,
-            .easing = Easing.linear,
-            .mode = .loop,
-        });
+        const now_ms: u64 = @intCast(@divFloor(
+            std.Io.Timestamp.now(main_mod.process_io, .awake).toNanoseconds(),
+            std.time.ns_per_ms,
+        ));
+        const phase = @as(f32, @floatFromInt(now_ms % self.period_ms)) /
+            @as(f32, @floatFromInt(self.period_ms));
+        cx.requestRenderAfter(FRAME_MS);
 
-        const breath = triangleWave(pulse.progress);
+        const breath = triangleWave(phase);
         const scale = SCALE_MIN + (1.0 - SCALE_MIN) * breath;
         const opacity = OPACITY_MIN + (1.0 - OPACITY_MIN) * breath;
         const drawn_size = self.size * scale;
 
         // Outer box stays at full `size` so the surrounding layout doesn't
-        // twitch as the inner rect scales.
-        cx.render(ui.box(.{
-            .width = self.size,
-            .height = self.size,
-            .alignment = .{ .main = .center, .cross = .center },
-        }, .{
-            ui.rect(.{
-                .width = drawn_size,
-                .height = drawn_size,
-                .corner_radius = drawn_size / 2.0,
-                .background = self.color.withAlpha(opacity),
-            }),
+        // twitch as the inner dot scales.
+        cx.render(ui.box(.{ .style = .{
+            .width = .{ .fixed = self.size },
+            .height = .{ .fixed = self.size },
+            .alignment = .center,
+        } }, .{
+            ui.box(.{ .style = .{
+                .width = .{ .fixed = drawn_size },
+                .height = .{ .fixed = drawn_size },
+                .corner_radius = .all(drawn_size / 2.0),
+                .background = .{ .rgba = self.color.withAlpha(opacity) },
+            } }, .{}),
         }));
     }
 };
 
-/// Fold 0..1 into 0→1→0, so one loop of the tween is one full breath in and
-/// out rather than a sawtooth that snaps back at the wrap.
+/// Fold 0..1 into 0→1→0, so one period is one full breath in and out
+/// rather than a sawtooth that snaps back at the wrap.
 fn triangleWave(phase: f32) f32 {
     std.debug.assert(phase >= 0.0);
     std.debug.assert(phase <= 1.0);

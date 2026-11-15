@@ -16,47 +16,42 @@ const AppState = state_mod.AppState;
 /// than collapsing to nothing.
 const BAR_HEIGHT_MIN: f32 = 3.0;
 const BAR_HEIGHT_MAX: f32 = 24.0;
-
-const MicrophoneLevelBar = struct {
-    height: f32,
-    color: Color,
-};
+/// The meter reads levels the capture thread writes; nothing tells Gooey
+/// they changed, so it asks for a frame this often while recording.
+const METER_FRAME_MS: u32 = 33;
 
 pub const MicrophoneMeter = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
         if (!s.recording.active) return;
+        cx.requestRenderAfter(METER_FRAME_MS);
 
         const t = theme_mod.get(s.dark_mode);
-        const levels = s.microphoneLevels();
-        var bars: [audio.WAVEFORM_BAR_COUNT]MicrophoneLevelBar = undefined;
-        for (levels, 0..) |level, level_index| {
-            std.debug.assert(level >= 0.0);
-            std.debug.assert(level <= 1.0);
-            bars[level_index] = .{
-                .height = BAR_HEIGHT_MIN + level * (BAR_HEIGHT_MAX - BAR_HEIGHT_MIN),
-                .color = t.danger,
-            };
-        }
-
-        cx.render(ui.box(.{
-            .height = 24,
+        cx.render(ui.box(.{ .style = .{
             .direction = .row,
+            .height = .{ .fixed = BAR_HEIGHT_MAX },
             .gap = 2,
             .alignment = .{ .main = .center, .cross = .end },
-        }, .{
-            ui.each(&bars, renderLevelBar),
+        } }, .{
+            LevelBars{ .levels = s.microphoneLevels(), .color = t.danger },
         }));
     }
 };
 
-fn renderLevelBar(bar: MicrophoneLevelBar, _: usize) @TypeOf(ui.box(ui.Box{}, .{})) {
-    std.debug.assert(bar.height >= BAR_HEIGHT_MIN);
-    std.debug.assert(bar.height <= BAR_HEIGHT_MAX);
-    return ui.box(.{
-        .width = 3,
-        .height = bar.height,
-        .corner_radius = 2,
-        .background = bar.color,
-    }, .{});
-}
+const LevelBars = struct {
+    levels: [audio.WAVEFORM_BAR_COUNT]f32,
+    color: Color,
+
+    pub fn render(self: LevelBars, cx: *Cx) void {
+        for (self.levels) |level| {
+            std.debug.assert(level >= 0.0);
+            std.debug.assert(level <= 1.0);
+            cx.render(ui.box(.{ .style = .{
+                .width = .{ .fixed = 3 },
+                .height = .{ .fixed = BAR_HEIGHT_MIN + level * (BAR_HEIGHT_MAX - BAR_HEIGHT_MIN) },
+                .corner_radius = .all(1.5),
+                .background = .{ .rgba = self.color },
+            } }, .{}));
+        }
+    }
+};

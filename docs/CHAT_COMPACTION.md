@@ -62,8 +62,8 @@ something.
 The obvious implementation — splice the summary into `messages` and delete the
 old entries — is the wrong shape for this codebase. `messages` is a ring
 buffer with a moving `message_head`, so "splice" means wrap-aware element
-moves; and every logical index the UI holds (`streaming_message_idx`, each
-`cached_height`, `list_state`'s item count) would be invalidated by the shift.
+moves; and every logical index the UI holds (`streaming_message_idx`, the
+transcript's message indices) would be invalidated by the shift.
 
 Instead: **never mutate `messages`.** Treat the ring as the UI transcript and
 the summary as a small derived cache that only affects _request assembly_.
@@ -82,7 +82,7 @@ passes the summary through the `system` field that `ChatRequest` already has.
 That is the entire mechanism. It buys:
 
 - No ring surgery, no wraparound edge cases, no `@memmove`.
-- `streaming_message_idx`, `cached_height`, and `list_state` are untouched.
+- `streaming_message_idx` and the transcript's message indices are untouched.
 - No new `MessageRole`, and no risk of the `.system => continue` trap.
 - Compaction is idempotent and re-runnable — recompacting is just recomputing
   a summary and advancing `summary_covers`.

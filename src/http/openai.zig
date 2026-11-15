@@ -489,9 +489,9 @@ pub const OpenAIClient = struct {
 
         pub fn requestRejected(c: @This(), status: http_std.Status) ChatResult {
             std.debug.assert(c.self.api_key.len > 0);
-            std.debug.assert(@intFromEnum(status) >= 400);
+            std.debug.assert(@backingInt(status) >= 400);
 
-            const status_code: u32 = @intFromEnum(status);
+            const status_code: u32 = @backingInt(status);
             log.err("OpenAI Chat Completions API HTTP {d}", .{status_code});
             const message: []const u8 = switch (status_code) {
                 400 => "Bad request",
@@ -784,8 +784,8 @@ const TranscribeAttemptCtx = struct {
 
     pub fn requestRejected(c: @This(), status: http_std.Status) TranscriptionResult {
         std.debug.assert(c.api_key.len > 0);
-        std.debug.assert(@intFromEnum(status) >= 400);
-        log.err("OpenAI transcription HTTP {d}", .{@intFromEnum(status)});
+        std.debug.assert(@backingInt(status) >= 400);
+        log.err("OpenAI transcription HTTP {d}", .{@backingInt(status)});
         return TranscriptionResult.err("Transcription request rejected");
     }
 

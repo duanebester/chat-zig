@@ -1,169 +1,115 @@
-//! Message row rendering and height measurement for the virtual list.
+//! One message in the transcript: the user's bubble or the assistant's
+//! plain text.
 //!
-//! `render` is the callback handed to `cx.lists.virtual`, so it has to both
-//! draw the row and return its height. Heights are cached on `AppState` and
-//! invalidated when the theme or window width changes, because a re-measure
-//! costs a full text shaping pass per message.
+//! Gooey 0.2.9 measured each row up front for a virtual list. Gooey 0.5's
+//! `List` still needs every row's height before layout, but render has no
+//! text measurement, so the transcript is a plain scroll box and layout wraps
+//! each message itself (see `ContentArea` for how its size is bounded).
 
+const std = @import("std");
 const gooey = @import("gooey");
 const Cx = gooey.Cx;
 const ui = gooey.ui;
-const Svg = gooey.components.Svg;
-const Lucide = gooey.components.Lucide;
+const Lucide = @import("gooey-components").Lucide;
 
 const state_mod = @import("../state.zig");
 const theme_mod = @import("../theme.zig");
 const constants = @import("constants.zig");
+const icon = @import("icon.zig").icon;
+const text_chunk = @import("../text_chunk.zig");
 
 const AppState = state_mod.AppState;
 const Message = state_mod.Message;
 
 const BUBBLE_CORNER_RADIUS = constants.BUBBLE_CORNER_RADIUS;
-const MESSAGE_HORIZONTAL_CHROME = constants.MESSAGE_HORIZONTAL_CHROME;
+const MESSAGE_TEXT_SIZE: u16 = 15;
 
-/// Virtual-list row callback: draws message `index` and returns its height.
-pub fn render(index: u32, cx: *Cx) f32 {
-    const s = cx.state(AppState);
-    const message_index: usize = @intCast(index);
-    const msg = s.getMessage(message_index) orelse return 0;
-    const is_user = msg.role == .user;
+comptime {
+    // `text_chunk.zig` stays gooey-free so `zig build test` can run it;
+    // this pins its limit to the one Gooey enforces.
+    std.debug.assert(text_chunk.codepoint_count_max == gooey.text.run_codepoint_count_max);
+}
 
-    const max_bubble_width = cx.windowSize().width - MESSAGE_HORIZONTAL_CHROME;
+pub const MessageRow = struct {
+    index: u32,
 
-    var height = s.getMessageCachedHeight(message_index);
-    if (height <= 0.0) {
-        height = if (is_user)
-            measureUserMessageHeight(cx, msg, max_bubble_width)
-        else
-            measureAssistantMessageHeight(cx, msg, max_bubble_width);
-        s.setMessageCachedHeight(message_index, height);
+    pub fn render(self: MessageRow, cx: *Cx) void {
+        const s = cx.state(AppState);
+        const msg = s.getMessage(self.index) orelse return;
+        const t = theme_mod.get(s.dark_mode);
+        switch (msg.role) {
+            .user => renderUser(cx, msg, t),
+            .assistant, .system => cx.render(ui.box(.{ .style = .{
+                .width = .{ .grow = 1 },
+                .padding = .symmetric(4, 0),
+            } }, .{
+                MessageText{ .text = msg.getText(), .color = t.text_secondary },
+            })),
+        }
     }
+};
 
-    if (is_user) {
-        renderUserMessage(msg, s.dark_mode, max_bubble_width, cx);
-    } else {
-        renderAssistantMessage(msg, s.dark_mode, max_bubble_width, cx);
-    }
-
-    return height;
+fn renderUser(cx: *Cx, msg: *const Message, t: theme_mod.Theme) void {
+    cx.render(ui.box(.{ .style = .{
+        .width = .{ .grow = 1 },
+        .padding = .symmetric(16, 14),
+        .gap = 10,
+        .background = .{ .rgba = t.user_bubble },
+        .border = .{ .width = 1, .color = .{ .rgba = t.user_bubble_border } },
+        .corner_radius = .all(BUBBLE_CORNER_RADIUS),
+    } }, .{
+        if (msg.hasAttachment()) AttachmentChip{ .name = msg.getAttachedFileName() } else null,
+        MessageText{ .text = msg.getText(), .color = t.text },
+    }));
 }
 
-/// Measure user message height using the platform text shaper (CoreText/HarfBuzz/browser).
-/// Falls back to character-width heuristic if measureText is unavailable.
-fn measureUserMessageHeight(cx: *Cx, msg: *const Message, max_width: f32) f32 {
-    const has_attachment = msg.hasAttachment();
-    const h_padding: f32 = 32.0; // .symmetric = .{ .x = 16, .y = 14 } → 16 * 2
-    const v_padding: f32 = 28.0; // 14 * 2
+const AttachmentChip = struct {
+    name: []const u8,
 
-    const m = cx.measureText(msg.getText(), .{
-        .max_width = max_width - h_padding,
-        .font_size = 15,
-    }) catch {
-        return fallbackUserHeight(msg, max_width);
-    };
-
-    var height = m.height + v_padding;
-    if (has_attachment) {
-        height += 32.0; // chip height + gap
-    }
-    return height;
-}
-
-/// Measure assistant message height using the platform text shaper.
-/// Falls back to character-width heuristic if measureText is unavailable.
-fn measureAssistantMessageHeight(cx: *Cx, msg: *const Message, max_width: f32) f32 {
-    const h_padding: f32 = 8.0; // .symmetric = .{ .x = 4 } → 4 * 2
-
-    const m = cx.measureText(msg.getText(), .{
-        .max_width = max_width - h_padding,
-        .font_size = 15,
-    }) catch {
-        return fallbackAssistantHeight(msg, max_width);
-    };
-
-    return m.height;
-}
-
-// ── Fallback heuristics (used when measureText is unavailable) ───────────
-
-fn fallbackUserHeight(msg: *const Message, max_width: f32) f32 {
-    const chars_per_line: usize = @max(1, @as(usize, @intFromFloat(max_width / 8.0)));
-    const lines: usize = @max(1, (msg.content_len + chars_per_line - 1) / chars_per_line);
-    var height: f32 = @as(f32, @floatFromInt(lines)) * 24.0 + 32.0;
-    if (msg.hasAttachment()) {
-        height += 32.0;
-    }
-    return height;
-}
-
-fn fallbackAssistantHeight(msg: *const Message, max_width: f32) f32 {
-    const chars_per_line: usize = @max(1, @as(usize, @intFromFloat(max_width / 8.0)));
-    const lines: usize = @max(1, (msg.content_len + chars_per_line - 1) / chars_per_line);
-    return @as(f32, @floatFromInt(lines)) * 24.0 + 16.0;
-}
-
-fn renderUserMessage(msg: *const Message, dark_mode: bool, max_width: f32, cx: *Cx) void {
-    const t = theme_mod.get(dark_mode);
-    const text_content = msg.getText();
-    const has_attachment = msg.hasAttachment();
-
-    // User message in a rounded box with subtle border
-    cx.render(ui.box(.{
-        .max_width = max_width,
-        .padding = .{ .symmetric = .{ .x = 16, .y = 14 } },
-        .background = t.user_bubble,
-        .border_color = t.user_bubble_border,
-        .border_width = .{ .all = 1 },
-        .corner_radius = BUBBLE_CORNER_RADIUS,
-    }, .{
-        ui.box(.{ .direction = .column, .gap = 10 }, .{
-            // File attachment chip (if present)
-            ui.when(has_attachment, .{
-                ui.box(.{
-                    .padding = .{ .symmetric = .{ .x = 10, .y = 6 } },
-                    .background = t.file_chip_bg,
-                    .corner_radius = 8,
-                }, .{
-                    ui.box(.{ .direction = .row, .gap = 6, .alignment = .{ .main = .start, .cross = .center } }, .{
-                        // File icon
-                        Svg{
-                            .path = Lucide.file,
-                            .size = 14,
-                            .no_fill = true,
-                            .stroke_color = t.file_chip_icon,
-                            .stroke_width = 1.5,
-                        },
-                        ui.text(msg.getAttachedFileName(), .{
-                            .color = t.file_chip_text,
-                            .size = 13,
-                            .weight = .medium,
-                        }),
-                    }),
-                }),
+    pub fn render(self: AttachmentChip, cx: *Cx) void {
+        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        cx.render(ui.box(.{ .style = .{
+            .direction = .row,
+            .padding = .symmetric(10, 6),
+            .gap = 6,
+            .alignment = .center_cross,
+            .background = .{ .rgba = t.file_chip_bg },
+            .corner_radius = .all(8),
+        } }, .{
+            icon(.{ .path = Lucide.file, .size = 14, .stroke = .accent }),
+            ui.text(self.name, .{
+                .color = .{ .rgba = t.file_chip_text },
+                .size = 13,
+                .weight = .medium,
             }),
-            // Message text
-            ui.text(text_content, .{
-                .color = t.text,
-                .size = 15,
+        }));
+    }
+};
+
+/// Wrapped message text, as one `ui.text` per chunk of at most
+/// `text_chunk.codepoint_count_max` codepoints: Gooey shapes a text as one
+/// run and panics past that, and replies run longer. Chunks end at a line break where
+/// one is in reach, so a split is invisible; only a single paragraph longer
+/// than a chunk breaks its line early, at a space.
+pub const MessageText = struct {
+    text: []const u8,
+    color: gooey.Color,
+
+    pub fn render(self: MessageText, cx: *Cx) void {
+        var rest = self.text;
+        // Each pass consumes at least one byte, so this ends; the bound is
+        // the bytes themselves.
+        var pass: usize = 0;
+        while (rest.len > 0) : (pass += 1) {
+            std.debug.assert(pass < self.text.len);
+            const split = text_chunk.next(rest);
+            std.debug.assert(split.skip_len >= split.text_len);
+            cx.render(ui.text(rest[0..split.text_len], .{
+                .color = .{ .rgba = self.color },
+                .size = MESSAGE_TEXT_SIZE,
                 .wrap = .words,
-            }),
-        }),
-    }));
-}
-
-fn renderAssistantMessage(msg: *const Message, dark_mode: bool, max_width: f32, cx: *Cx) void {
-    const t = theme_mod.get(dark_mode);
-    const text_content = msg.getText();
-
-    // Assistant response - plain text, no bubble
-    cx.render(ui.box(.{
-        .max_width = max_width,
-        .padding = .{ .symmetric = .{ .x = 4, .y = 0 } },
-    }, .{
-        ui.text(text_content, .{
-            .color = t.text_secondary,
-            .size = 15,
-            .wrap = .words,
-        }),
-    }));
-}
+            }));
+            rest = rest[split.skip_len..];
+        }
+    }
+};

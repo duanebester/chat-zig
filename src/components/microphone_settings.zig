@@ -1,15 +1,19 @@
 //! Input device picker plus refresh button, shown in the settings panel.
 
+const std = @import("std");
 const gooey = @import("gooey");
 const Cx = gooey.Cx;
 const ui = gooey.ui;
-const Svg = gooey.components.Svg;
-const Lucide = gooey.components.Lucide;
-const Select = gooey.components.Select;
+const Handler = gooey.Handler;
+const components = @import("gooey-components");
+const Lucide = components.Lucide;
+const Select = components.Select;
 
 const state_mod = @import("../state.zig");
 const theme_mod = @import("../theme.zig");
 const constants = @import("constants.zig");
+const audio = @import("../audio/mod.zig");
+const icon = @import("icon.zig").icon;
 
 const AppState = state_mod.AppState;
 
@@ -19,38 +23,51 @@ pub const MicrophoneSettings = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
         const t = theme_mod.get(s.dark_mode);
+        const options = s.microphone.options();
 
-        cx.render(ui.box(.{ .fill_width = true, .direction = .row, .gap = 8, .alignment = .{ .main = .start, .cross = .center } }, .{
-            Svg{ .path = Lucide.mic, .size = 16, .no_fill = true, .stroke_color = t.icon_muted, .stroke_width = 1.5 },
+        var on_select: [audio.MAX_INPUT_DEVICES]Handler = undefined;
+        std.debug.assert(options.len <= on_select.len);
+        for (on_select[0..options.len], 0..) |*handler, index| {
+            handler.* = cx.on(AppState.selectMicrophone, .{ .arg = @as(u32, @intCast(index)) });
+        }
+
+        cx.render(ui.box(.{ .style = .{
+            .direction = .row,
+            .width = .{ .grow = 1 },
+            .gap = 10,
+            .alignment = .center_cross,
+        } }, .{
+            icon(.{ .path = Lucide.mic, .size = 16, .stroke = .secondary }),
             Select{
-                .id = "microphone-select",
-                .options = s.microphone.options(),
+                .key = "microphone-select",
+                .options = options,
+                .on_select = on_select[0..options.len],
+                .on_toggle = cx.on(AppState.toggleSelect, .{ .arg = state_mod.SelectId.microphone }),
+                .on_close = cx.on(AppState.closeSelect, .{ .arg = state_mod.SelectId.microphone }),
                 .selected = s.microphone.selected,
-                .placeholder = "No microphones found",
+                .open = s.open_select == .microphone,
+                .placeholder = "No microphones",
+                .disabled = options.len == 0,
                 .width = 240,
-                .background = t.card,
-                .border_color = t.border,
-                .focus_border_color = t.primary,
-                .text_color = t.text_secondary,
-                .hover_background = t.border,
-                .option_hover_background = t.border,
-                .selected_background = t.primary.withAlpha(0.15),
-                .on_select = cx.onSelect(AppState.selectMicrophone),
+                .accessible_name = "Microphone",
             },
             ui.box(.{
-                .width = 28,
-                .height = 28,
-                .corner_radius = BUTTON_CORNER_RADIUS,
-                .alignment = .{ .main = .center, .cross = .center },
-                .cursor = if (s.recording.active) null else .pointer,
-                .on_click_handler = if (s.recording.active) null else cx.command(AppState.refreshMicrophones),
+                .style = .{
+                    .width = .{ .fixed = 28 },
+                    .height = .{ .fixed = 28 },
+                    .corner_radius = .all(BUTTON_CORNER_RADIUS),
+                    .alignment = .center,
+                    .cursor = if (s.recording.active) null else .pointer,
+                },
+                .on_click = if (s.recording.active) null else cx.on(AppState.refreshMicrophones, .{}),
+                .a11y = .{ .role = .button, .label = "Refresh microphones", .disabled = s.recording.active },
             }, .{
-                Svg{ .path = Lucide.refresh_cw, .size = 14, .no_fill = true, .stroke_color = t.icon_muted, .stroke_width = 1.5 },
+                icon(.{ .path = Lucide.refresh_cw, .size = 14, .stroke = .secondary }),
             }),
         }));
 
         if (s.recording.last_error) |capture_error| {
-            cx.render(ui.text(@errorName(capture_error), .{ .color = t.danger, .size = 12 }));
+            cx.render(ui.text(@errorName(capture_error), .{ .color = .{ .rgba = t.danger }, .size = 12 }));
         }
     }
 };

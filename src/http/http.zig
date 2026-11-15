@@ -38,10 +38,10 @@ pub fn AttemptOutcome(comptime T: type) type {
 }
 
 pub fn classifyHttpStatus(status: http.Status) FetchError {
-    std.debug.assert(@intFromEnum(status) >= 100);
-    std.debug.assert(@intFromEnum(status) <= 999);
+    std.debug.assert(@backingInt(status) >= 100);
+    std.debug.assert(@backingInt(status) <= 999);
 
-    return switch (@intFromEnum(status)) {
+    return switch (@backingInt(status)) {
         408, 429 => error.Transient,
         500...599 => error.Transient,
         else => error.Permanent,
@@ -178,7 +178,7 @@ pub fn performOneHttpAttempt(
                 const retry_after_seconds = parseRetryAfterFromHead(response.head);
                 log.info("{s} HTTP {d} is retryable", .{
                     options.label,
-                    @intFromEnum(response.head.status),
+                    @backingInt(response.head.status),
                 });
                 return .{ .transient = retry_after_seconds };
             },

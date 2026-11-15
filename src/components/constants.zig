@@ -5,17 +5,23 @@
 //! list's horizontal padding all key off the same numbers. Duplicating them
 //! per file would let the UI silently drift apart.
 
-pub const INPUT_CARD_CORNER_RADIUS = 16;
-pub const BUBBLE_CORNER_RADIUS = 12;
-pub const BUTTON_CORNER_RADIUS = 6;
+const ui = @import("gooey").ui;
+
+pub const INPUT_CARD_CORNER_RADIUS: f32 = 16;
+pub const BUBBLE_CORNER_RADIUS: f32 = 12;
+pub const BUTTON_CORNER_RADIUS: f32 = 6;
 pub const ACTION_BUTTON_SIZE: f32 = 36;
 pub const ACTION_ICON_SIZE: f32 = 18;
-pub const CONTENT_PADDING = 24;
+pub const CONTENT_PADDING: f32 = 24;
 pub const CHAT_MIN_WIDTH: f32 = 400;
 
-/// Horizontal chrome between the window edge and a message bubble: the root
-/// chat column's 20px on each side, plus the virtual list's `CONTENT_PADDING`
-/// on each side. `message.zig` subtracts this from the window width to get
-/// the bubble's max width, and both the measure and render paths must use
-/// the same value or cached heights won't match what's drawn.
-pub const MESSAGE_HORIZONTAL_CHROME: f32 = 40 + (CONTENT_PADDING * 2);
+/// The 36 px square, rounded, pointer-cursor box the toolbar's icon buttons
+/// share. A shared `ui.Style` constant: Gooey 0.4 keeps per-element fields
+/// (handlers, keys, a11y) on `ui.Box`, so styles can be reused as values.
+pub const toolbar_button: ui.Style = .{
+    .width = .{ .fixed = 36 },
+    .height = .{ .fixed = 36 },
+    .corner_radius = .all(8),
+    .alignment = .center,
+    .cursor = .pointer,
+};
