@@ -5,7 +5,7 @@
 //! Prerequisites:
 //!   Set ANTHROPIC_API_KEY environment variable
 //!   Optionally set OPENAI_API_KEY to enable GPT models and voice recording ->
-//!   text transcription (gpt-4o-mini-transcribe)
+//!   text transcription (gpt-transcribe)
 //!
 //! Run with: zig build run
 //!
