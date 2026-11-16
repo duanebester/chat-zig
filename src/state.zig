@@ -158,25 +158,22 @@ pub const Model = enum(u8) {
     sonnet,
     opus,
     gpt_sol,
-    gpt_terra,
     gpt_luna,
 
     pub const display_names = [_][]const u8{
         "Claude Haiku 5.5",
         "Claude Sonnet 5.5",
         "Claude Opus 5.5",
-        "GPT-5.6 Sol",
-        "GPT-5.6 Terra",
-        "GPT-5.6 Luna",
+        "GPT-6.1 Sol",
+        "GPT-6 Luna",
     };
 
     pub const api_names = [_][]const u8{
         "claude-haiku-5-5",
         "claude-sonnet-5-5",
         "claude-opus-5-5",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
+        "gpt-6.1-sol",
+        "gpt-6-luna",
     };
 
     /// Parallel array to `display_names`/`api_names` (table-driven, CLAUDE
@@ -185,7 +182,7 @@ pub const Model = enum(u8) {
     /// a model means updating all three.
     pub const providers = [_]ModelProvider{
         .anthropic, .anthropic, .anthropic,
-        .openai,    .openai,    .openai,
+        .openai,    .openai,
     };
 
     /// Input context window, in tokens — the denominator
@@ -201,9 +198,11 @@ pub const Model = enum(u8) {
     /// Models API's `max_input_tokens` for each 5.5 model (checked
     /// 2026-11-15); their 128k `max_tokens` is far above the app's own
     /// output caps (`anthropic.MAX_TOKENS`, `COMPACTION_MAX_TOKENS`).
+    /// The GPT-6 models accept 922k input tokens, but prompts over 272k are
+    /// billed at a higher rate, so compaction keeps them under that tier.
     pub const context_window_tokens = [_]u32{
         1_000_000, 1_000_000, 1_000_000,
-        272_000,   272_000,   272_000,
+        272_000,   272_000,
     };
 
     pub fn displayName(self: Model) []const u8 {
@@ -223,7 +222,7 @@ pub const Model = enum(u8) {
     }
 };
 
-pub const MODEL_COUNT: usize = 6;
+pub const MODEL_COUNT: usize = 5;
 
 comptime {
     std.debug.assert(Model.display_names.len == MODEL_COUNT);
@@ -237,17 +236,14 @@ comptime {
 // =============================================================================
 
 pub const DictationModel = enum(u8) {
-    gpt4o_mini_transcribe,
-    gpt4o_transcribe,
+    gpt_transcribe,
 
     pub const display_names = [_][]const u8{
-        "GPT-4o mini Transcribe",
-        "GPT-4o Transcribe",
+        "GPT-Transcribe",
     };
 
     pub const api_names = [_][]const u8{
-        "gpt-4o-mini-transcribe",
-        "gpt-4o-transcribe",
+        "gpt-transcribe",
     };
 
     pub fn displayName(self: DictationModel) []const u8 {
@@ -259,7 +255,7 @@ pub const DictationModel = enum(u8) {
     }
 };
 
-pub const DICTATION_MODEL_COUNT: usize = 2;
+pub const DICTATION_MODEL_COUNT: usize = 1;
 
 // The default dictation model (index 0) must always match OpenAI's
 // hardcoded fallback in `openai.zig` — otherwise the Settings panel and
@@ -419,7 +415,7 @@ pub const AppState = struct {
     open_select: ?SelectId = null,
 
     selected_model: Model = .haiku,
-    selected_dictation_model: DictationModel = .gpt4o_mini_transcribe,
+    selected_dictation_model: DictationModel = .gpt_transcribe,
     microphone: MicrophoneState = .{},
     recording: RecordingState = .{},
 
