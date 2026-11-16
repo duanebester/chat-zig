@@ -13,15 +13,12 @@ const theme_mod = @import("../theme.zig");
 const constants = @import("constants.zig");
 const icon = @import("icon.zig").icon;
 const ComposerActions = @import("composer_actions.zig").ComposerActions;
-const WidthProbe = @import("width_probe.zig").WidthProbe;
 
 const AppState = state_mod.AppState;
 
 const INPUT_CARD_CORNER_RADIUS = constants.INPUT_CARD_CORNER_RADIUS;
 /// The text row's horizontal padding inside the card.
 const TEXT_ROW_PADDING_X: f32 = 16;
-/// Narrowest the input gets, whatever the probe reports.
-const TEXT_AREA_WIDTH_MIN: f32 = 120;
 
 pub const InputArea = struct {
     pub fn render(_: @This(), cx: *Cx) void {
@@ -33,16 +30,6 @@ pub const InputArea = struct {
         // up shows real history — what the user needs told is that the
         // older part is being *sent* in condensed form.
         const compaction_banner = s.compactionBanner();
-
-        // `TextArea` takes a fixed width and render cannot read the window's,
-        // so a zero-height probe below the input measures the row each frame
-        // (`WidthProbe`) and the next build uses it. When the width just
-        // changed (a resize), build once more so the input catches up even
-        // if nothing else renders.
-        if (s.composer_width != s.composer_width_used) cx.requestRenderAfter(16);
-        s.composer_width_used = s.composer_width;
-        s.composer_probe = .{ .width = &s.composer_width };
-        const text_area_width = @max(TEXT_AREA_WIDTH_MIN, s.composer_width_used);
 
         // Both boxes are keyed so the `TextArea`'s id stays put. An unkeyed
         // box's id comes from its position among its siblings, and the
@@ -78,12 +65,10 @@ pub const InputArea = struct {
                             "API key required",
                         .bind = &s.input_slice,
                         .rows = 2,
-                        .width = text_area_width,
+                        // Fill the row; it draws at the window's width in
+                        // the frame that resizes it.
+                        .width = null,
                     },
-                    ui.paint(WidthProbe, &s.composer_probe, WidthProbe.paint, .{
-                        .width = .{ .grow = 1 },
-                        .height = .{ .fixed = 0 },
-                    }),
                 }),
                 if (s.has_attached_file) AttachedFile{ .name = s.getAttachedFileName() } else null,
                 ComposerActions{},

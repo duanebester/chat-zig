@@ -32,7 +32,6 @@ const SessionLog = session_log_mod.SessionLog;
 
 const jobs = @import("jobs.zig");
 const theme_mod = @import("theme.zig");
-const WidthProbe = @import("components/width_probe.zig").WidthProbe;
 
 // =============================================================================
 // Constants (CLAUDE rule #4: put a limit on everything)
@@ -418,15 +417,6 @@ pub const AppState = struct {
     /// controlled: the app owns the open flag and closes it on a pick or a
     /// click outside.
     open_select: ?SelectId = null,
-    /// Width of the composer card's text row, measured by a probe painted
-    /// in the last frame (see `InputArea`). Gooey's `TextArea` takes a fixed
-    /// width, and render has no window size, so this is how the input
-    /// follows the window. 500 px window minus the column and card padding.
-    composer_width: f32 = 426,
-    /// The `composer_width` the last build used.
-    composer_width_used: f32 = 426,
-    /// The probe's paint data; it must outlive the build that emits it.
-    composer_probe: WidthProbe = .{},
 
     selected_model: Model = .haiku,
     selected_dictation_model: DictationModel = .gpt4o_mini_transcribe,
