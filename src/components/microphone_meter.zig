@@ -26,7 +26,7 @@ pub const MicrophoneMeter = struct {
         if (!s.recording.active) return;
         cx.requestRenderAfter(METER_FRAME_MS);
 
-        const t = theme_mod.get(s.dark_mode);
+        const t = theme_mod.get(s.theme);
         cx.render(ui.box(.{ .style = .{
             .direction = .row,
             .height = .{ .fixed = BAR_HEIGHT_MAX },

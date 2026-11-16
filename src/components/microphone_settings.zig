@@ -22,7 +22,7 @@ const BUTTON_CORNER_RADIUS = constants.BUTTON_CORNER_RADIUS;
 pub const MicrophoneSettings = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
+        const t = theme_mod.get(s.theme);
         const options = s.microphone.options();
 
         var on_select: [audio.MAX_INPUT_DEVICES]Handler = undefined;

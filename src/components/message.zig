@@ -69,7 +69,7 @@ pub const MessageRow = struct {
     pub fn render(self: MessageRow, cx: *Cx) void {
         const s = cx.state(AppState);
         const msg = s.getMessage(self.index) orelse return;
-        const t = theme_mod.get(s.dark_mode);
+        const t = theme_mod.get(s.theme);
         switch (msg.role) {
             .user => renderUser(cx, msg, t),
             .assistant, .system => cx.render(ui.box(.{ .style = .{
@@ -102,7 +102,7 @@ const AttachmentChip = struct {
     name: []const u8,
 
     pub fn render(self: AttachmentChip, cx: *Cx) void {
-        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        const t = theme_mod.get(cx.state(AppState).theme);
         cx.render(ui.box(.{ .style = .{
             .direction = .row,
             .padding = .symmetric(CHIP_PADDING_X, CHIP_PADDING_Y),

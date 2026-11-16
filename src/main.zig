@@ -29,7 +29,7 @@ pub const App = gooey.App(AppState, layout.render, .{
     .width = 500,
     .height = 700,
     .limits = limits_mod.limits,
-    // The app starts in dark mode (`AppState.dark_mode`).
+    // The app starts on the Dark theme (`AppState.theme`).
     .theme = &theme.gooey_dark,
     // macOS: the toolbar shares the traffic lights' row (`layout.zig`).
     .title_bar = .transparent,

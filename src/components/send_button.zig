@@ -21,7 +21,7 @@ const BUTTON_CORNER_RADIUS = constants.BUTTON_CORNER_RADIUS;
 pub const SendButton = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
+        const t = theme_mod.get(s.theme);
         const can_send = s.has_api_key and s.input_slice.len > 0;
 
         cx.render(ui.box(.{

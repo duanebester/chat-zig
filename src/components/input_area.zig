@@ -26,7 +26,7 @@ const TEXT_AREA_WIDTH_MIN: f32 = 120;
 pub const InputArea = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
+        const t = theme_mod.get(s.theme);
 
         // Compaction marker. Deliberately a banner rather than a row in
         // the message list: the ring still holds every turn, so scrolling
@@ -96,7 +96,7 @@ const CompactionBanner = struct {
     text: []const u8,
 
     pub fn render(self: CompactionBanner, cx: *Cx) void {
-        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        const t = theme_mod.get(cx.state(AppState).theme);
         cx.render(ui.box(.{ .style = .{
             .direction = .row,
             .width = .{ .grow = 1 },
@@ -116,7 +116,7 @@ const ErrorBanner = struct {
     text: []const u8,
 
     pub fn render(self: ErrorBanner, cx: *Cx) void {
-        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        const t = theme_mod.get(cx.state(AppState).theme);
         cx.render(ui.box(.{
             .style = .{
                 .width = .{ .grow = 1 },
@@ -135,7 +135,7 @@ const AttachedFile = struct {
     name: []const u8,
 
     pub fn render(self: AttachedFile, cx: *Cx) void {
-        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        const t = theme_mod.get(cx.state(AppState).theme);
         cx.render(ui.box(.{ .style = .{
             .direction = .row,
             .padding = .symmetric(16, 4),

@@ -24,4 +24,5 @@ pub const RecordButton = @import("record_button.zig").RecordButton;
 pub const SendButton = @import("send_button.zig").SendButton;
 pub const SettingsPanel = @import("settings_panel.zig").SettingsPanel;
 pub const SettingsToggle = @import("settings_toggle.zig").SettingsToggle;
+pub const ThemeSelector = @import("theme_selector.zig").ThemeSelector;
 pub const ThemeToggle = @import("theme_toggle.zig").ThemeToggle;

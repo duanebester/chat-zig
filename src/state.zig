@@ -333,7 +333,7 @@ pub const Message = struct {
 // =============================================================================
 
 /// The settings panel's dropdowns, for `AppState.open_select`.
-pub const SelectId = enum(u8) { model, dictation_model, microphone };
+pub const SelectId = enum(u8) { model, dictation_model, microphone, theme };
 
 pub const AppState = struct {
     const Self = @This();
@@ -402,7 +402,10 @@ pub const AppState = struct {
     has_openai_api_key: bool = false,
     is_transcribing: bool = false,
     error_message: ?[]const u8 = null,
-    dark_mode: bool = true, // Start in dark mode like the reference image.
+    /// The palette in use; starts on Dark like the reference image
+    /// (`main.zig`'s `Config.theme` matches). Like the model choices, it
+    /// lasts for the session.
+    theme: theme_mod.Choice = .dark,
     /// When true, the content area shows `SettingsPanel` (a full-length
     /// settings view) instead of `ContentArea`'s message list. Mutually
     /// exclusive with `history_expanded` — see `toggleSettings`.
@@ -860,11 +863,24 @@ pub const AppState = struct {
     // Theme / Model Toggles
     // =========================================================================
 
-    /// Flips the palette. Gooey's stock components (`TextArea`, `Select`)
-    /// read theme tokens, so the matching `gooey.Theme` goes with it.
-    pub fn toggleDarkMode(self: *Self, effects: *Effects) void {
-        self.dark_mode = !self.dark_mode;
-        effects.setTheme(theme_mod.gooeyFor(self.dark_mode));
+    /// The toolbar's theme button: the next theme in `Choice` order.
+    pub fn cycleTheme(self: *Self, effects: *Effects) void {
+        self.applyTheme(self.theme.next(), effects);
+    }
+
+    /// The Settings theme `Select`.
+    pub fn selectTheme(self: *Self, index: u32, effects: *Effects) void {
+        std.debug.assert(index < theme_mod.Choice.count);
+        self.applyTheme(@fromBackingInt(@intCast(index)), effects);
+        self.open_select = null;
+    }
+
+    /// Gooey's stock components (`TextArea`, `Select`) and the macOS title
+    /// bar read the `gooey.Theme`, so the matching one goes with the palette.
+    fn applyTheme(self: *Self, choice: theme_mod.Choice, effects: *Effects) void {
+        self.theme = choice;
+        effects.setTheme(theme_mod.gooeyFor(choice));
+        std.debug.assert(self.theme == choice);
     }
 
     /// Toggles the settings view. Mutually exclusive with the history view

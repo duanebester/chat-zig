@@ -23,7 +23,7 @@ pub const RecordButton = struct {
 
     pub fn render(self: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
+        const t = theme_mod.get(s.theme);
 
         cx.render(ui.box(.{
             .style = .{
