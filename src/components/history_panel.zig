@@ -92,7 +92,7 @@ const Row = struct {
 
     pub fn render(self: Row, cx: *Cx) void {
         const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
+        const t = theme_mod.get(s.theme);
         const entry = s.getSessionEntry(self.index) orelse return;
         const is_current = if (s.session_log.currentSeconds()) |cur| cur == entry.unix_seconds else false;
 

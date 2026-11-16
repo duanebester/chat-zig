@@ -16,6 +16,7 @@ const constants = @import("constants.zig");
 const ModelSelector = @import("model_selector.zig").ModelSelector;
 const DictationModelSelector = @import("dictation_model_selector.zig").DictationModelSelector;
 const MicrophoneSettings = @import("microphone_settings.zig").MicrophoneSettings;
+const ThemeSelector = @import("theme_selector.zig").ThemeSelector;
 
 const AppState = state_mod.AppState;
 
@@ -46,6 +47,7 @@ pub const SettingsPanel = struct {
             // page doesn't show a picker with nothing to pick from.
             if (s.has_openai_api_key) Card(DictationModelSelector){ .title = "Dictation model" } else null,
             Card(MicrophoneSettings){ .title = "Microphone" },
+            Card(ThemeSelector){ .title = "Theme" },
         }));
     }
 };
@@ -56,7 +58,7 @@ fn Card(comptime Control: type) type {
         title: []const u8,
 
         pub fn render(self: @This(), cx: *Cx) void {
-            const t = theme_mod.get(cx.state(AppState).dark_mode);
+            const t = theme_mod.get(cx.state(AppState).theme);
             cx.render(ui.box(.{ .style = .{
                 .width = .{ .grow = 1 },
                 .gap = 8,

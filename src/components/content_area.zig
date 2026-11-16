@@ -30,7 +30,7 @@ const KEY_BANNER_WIDTH_MAX: f32 = 500 - 40 - CONTENT_PADDING * 2;
 pub const ContentArea = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
-        const t = theme_mod.get(s.dark_mode);
+        const t = theme_mod.get(s.theme);
 
         if (s.message_count == 0) {
             s.message_list_id = null;
@@ -116,7 +116,7 @@ const KeyBanner = struct {
     text: []const u8,
 
     pub fn render(self: KeyBanner, cx: *Cx) void {
-        const t = theme_mod.get(cx.state(AppState).dark_mode);
+        const t = theme_mod.get(cx.state(AppState).theme);
         cx.render(ui.box(.{
             .style = .{
                 // A fit-width box does not shrink to its parent, so its text

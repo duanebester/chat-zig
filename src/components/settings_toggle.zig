@@ -23,7 +23,7 @@ pub const SettingsToggle = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
         cx.render(ui.box(.{
-            .style = constants.toolbar_button,
+            .style = constants.toolbarButton(cx.titleBarInset().top),
             .on_click = cx.on(AppState.toggleSettings, .{}),
             .a11y = .{ .role = .button, .label = if (s.settings_expanded) "Back to chat" else "Settings" },
         }, .{

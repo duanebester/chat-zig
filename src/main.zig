@@ -29,8 +29,12 @@ pub const App = gooey.App(AppState, layout.render, .{
     .width = 500,
     .height = 700,
     .limits = limits_mod.limits,
-    // The app starts in dark mode (`AppState.dark_mode`).
+    // The app starts on the Dark theme (`AppState.theme`).
     .theme = &theme.gooey_dark,
+    // macOS: the toolbar shares the traffic lights' row (`layout.zig`).
+    .title_bar = .transparent,
+    // Narrower than the chat column's minimum, the layout clips on the right.
+    .min_width = @intFromFloat(@import("components/constants.zig").WINDOW_MIN_WIDTH),
     // Ctrl+Q for Linux and Windows; macOS also gets Cmd+Q from its app menu.
     .keymap = &.{
         .{ .keys = "cmd-q", .action = gooey.ui.action(layout.Quit) },

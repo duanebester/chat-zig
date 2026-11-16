@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .gooey = .{
-            .url = "git+https://github.com/duanebester/gooey?ref=v0.6.0#7a272eb64f6787623f27bc6a0577683b85138dfd",
-            .hash = "gooey-0.6.0-uPBZ7kqoWwCdPTF5p29X38iPBYSvuON6KN_AaU2y41rz",
+            .url = "git+https://github.com/duanebester/gooey?ref=v0.6.2#3619cec22740ad683270359e12a523b399ed37a7",
+            .hash = "gooey-0.6.2-uPBZ7nAbXACkRll_qUrUJGD9VLDlIWB7xtnSblFGf07G",
         },
     },
     .paths = .{

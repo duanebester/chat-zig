@@ -22,7 +22,7 @@ pub const HistoryToggle = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
         cx.render(ui.box(.{
-            .style = constants.toolbar_button,
+            .style = constants.toolbarButton(cx.titleBarInset().top),
             .on_click = cx.on(AppState.toggleHistory, .{}),
             .a11y = .{ .role = .button, .label = if (s.history_expanded) "Back to chat" else "History" },
         }, .{

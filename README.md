@@ -5,7 +5,7 @@ to both Anthropic's Claude and OpenAI's GPT models.
 
 Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version).
 
-> **Status:** Zig 0.17 / Gooey v0.6.0. Runs on macOS and on Linux (Wayland).
+> **Status:** Zig 0.17 / Gooey v0.6.2. Runs on macOS and on Linux (Wayland).
 > HTTP runs as Gooey background jobs (`effects.spawn`) that post results back to the
 > main thread; files and session logs use `std.Io.Dir` / `std.Io.File`;
 > both the Anthropic and OpenAI paths use the `io`-aware `std.http.Client`.
@@ -23,7 +23,7 @@ Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version
 - 🎙️ Voice dictation — record a microphone clip and transcribe it via OpenAI (`gpt-4o-mini-transcribe`)
 - 🧹 Automatic chat compaction — long conversations are summarized so requests stay bounded, with Anthropic's native compaction where the model supports it (see [`docs/CHAT_COMPACTION.md`](docs/CHAT_COMPACTION.md))
 - 💾 Session persistence — conversations are logged to `sessions/*.jsonl` and browsable/restorable from a history panel
-- 🎨 Light/dark theme
+- 🎨 Four themes — Light, Dark, and Catppuccin Latte and Macchiato — from Settings or the toolbar
 - 📜 Streaming replies into a scrolling transcript of any length that follows the newest message
 - 🔄 Async HTTP requests as Gooey background jobs (non-blocking UI, no polling, zero heap per result), with retry/backoff shared across providers
 - ✂️ Stop button cancels the in-flight request
@@ -35,10 +35,10 @@ Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version
 2. **Anthropic API Key** — Get one from [Anthropic Console](https://console.anthropic.com/). Required for Claude models.
 3. **OpenAI API Key** (optional) — Get one from [OpenAI Platform](https://platform.openai.com/). Enables GPT chat models and voice dictation transcription; the app runs fine without it, just with those features disabled.
 
-Gooey is pinned to [v0.6.0](https://github.com/duanebester/gooey/releases/tag/v0.6.0) in `build.zig.zon`. To move to another release:
+Gooey is pinned to [v0.6.2](https://github.com/duanebester/gooey/releases/tag/v0.6.2) in `build.zig.zon`. To move to another release:
 
 ```bash
-zig fetch --save git+https://github.com/duanebester/gooey#v0.6.0
+zig fetch --save git+https://github.com/duanebester/gooey#v0.6.2
 ```
 
 **macOS** 14 or newer. **Linux** needs a Wayland compositor and Gooey's system libraries
