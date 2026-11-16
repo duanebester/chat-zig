@@ -55,16 +55,15 @@ const anthropic = @import("anthropic.zig");
 
 const TRANSCRIPTION_API_URL = "https://api.openai.com/v1/audio/transcriptions";
 
-/// Default model used for recording -> text. Small, fast, and cheap — a
-/// good fit for short voice notes dictated into a chat input box. The user
-/// can pick a different transcription model in Settings (see
-/// `state.DictationModel`); this is only the initial value.
-pub const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
+/// Default model used for recording -> text. OpenAI's recommended file
+/// transcription model; the `gpt-4o` transcribe models it replaces shut down
+/// on 2027-02-26. The Settings picker (`state.DictationModel`) starts here.
+pub const DEFAULT_TRANSCRIBE_MODEL = "gpt-transcribe";
 
 /// Upper bound on a transcription model name's length, used to size the
 /// multipart request buffer without depending on which model is actually
 /// selected. Comfortably covers every model in `state.DictationModel`
-/// (longest today is "gpt-4o-mini-transcribe" at 22 bytes).
+/// (longest today is "gpt-transcribe" at 14 bytes).
 const MAX_MODEL_NAME_LEN: usize = 32;
 
 /// OpenAI rejects audio uploads over 25MB; stay comfortably under that so

@@ -20,7 +20,7 @@ Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version
 ## Features
 
 - 💬 Chat with Claude and GPT models, switchable per-conversation from the settings panel
-- 🎙️ Voice dictation — record a microphone clip and transcribe it via OpenAI (`gpt-4o-mini-transcribe`)
+- 🎙️ Voice dictation — record a microphone clip and transcribe it via OpenAI (`gpt-transcribe`)
 - 🧹 Automatic chat compaction — long conversations are summarized so requests stay bounded, with Anthropic's native compaction where the model supports it (see [`docs/CHAT_COMPACTION.md`](docs/CHAT_COMPACTION.md))
 - 💾 Session persistence — conversations are logged to `sessions/*.jsonl` and browsable/restorable from a history panel
 - 🎨 Four themes — Light, Dark, and Catppuccin Latte and Macchiato — from Settings or the toolbar
