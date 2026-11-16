@@ -10,12 +10,8 @@ Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version
 > main thread; files and session logs use `std.Io.Dir` / `std.Io.File`;
 > both the Anthropic and OpenAI paths use the `io`-aware `std.http.Client`.
 
-<table>
-  <tr>
-    <td><img src="https://github.com/duanebester/chat-zig/blob/main/assets/light.png" height="300px" /></td>
-    <td><img src="https://github.com/duanebester/chat-zig/blob/main/assets/dark.png" height="300px" /></td>
-  </tr>
-</table>
+<img src="assets/themes.png" width="820px"
+  alt="ChatZig in its Light, Catppuccin Latte, Catppuccin Macchiato, and Dark themes" />
 
 ## Features
 
@@ -28,6 +24,25 @@ Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version
 - 🔄 Async HTTP requests as Gooey background jobs (non-blocking UI, no polling, zero heap per result), with retry/backoff shared across providers
 - ✂️ Stop button cancels the in-flight request
 - ⌨️ Text input (with IME) and send button, file attachments, and a live microphone level meter while recording
+
+## Runtime
+
+Measured on a MacBook Pro (M2 Max) running macOS 26.6, ReleaseFast build, with a
+1000×750 pt window on a 120 Hz display.
+
+| | |
+|---|---|
+| Binary | 10.4 MiB (ReleaseFast), 9.3 MiB (ReleaseSmall) |
+| Launch to first window | ~235 ms warm |
+| Memory, idle | ~60 MB physical footprint |
+| Memory, 200-message session | ~80 MB physical footprint |
+| CPU, idle | 0.3% (no frames are drawn when nothing changes) |
+| CPU, streaming a reply | ~5% of one core |
+| Frame time, streaming | main thread p50 0.8 ms, p99 2.1 ms |
+| Frame time, scrolling | steady 120 fps, main thread p99 1.6 ms |
+
+Memory is `vmmap --summary` physical footprint; frame times come from a
+`-Dframe-trace=passive` build of the same commit.
 
 ## Prerequisites
 
