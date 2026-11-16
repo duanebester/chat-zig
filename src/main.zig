@@ -31,6 +31,8 @@ pub const App = gooey.App(AppState, layout.render, .{
     .limits = limits_mod.limits,
     // The app starts in dark mode (`AppState.dark_mode`).
     .theme = &theme.gooey_dark,
+    // macOS: the toolbar shares the traffic lights' row (`layout.zig`).
+    .title_bar = .transparent,
     // Ctrl+Q for Linux and Windows; macOS also gets Cmd+Q from its app menu.
     .keymap = &.{
         .{ .keys = "cmd-q", .action = gooey.ui.action(layout.Quit) },

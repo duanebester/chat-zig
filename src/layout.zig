@@ -1,14 +1,14 @@
 //! Root Layout for ChatAI
 //!
 //! Modern chat UI layout with:
-//! - A toolbar (history, settings, dark/light toggle) across the top
+//! - A toolbar (history, settings, dark/light toggle) across the top, in
+//!   the title bar beside the traffic lights on macOS
 //! - Clean full-width message display area
 //! - Elegant input area card at bottom
 //!
 //! This file owns only the root composition. Everything with a `render`
 //! method lives in `components/` — see `components/mod.zig`.
 
-const builtin = @import("builtin");
 const gooey = @import("gooey");
 const Cx = gooey.Cx;
 const Effects = gooey.Effects;
@@ -29,13 +29,6 @@ const ThemeToggle = components.ThemeToggle;
 
 const CHAT_MIN_WIDTH = components.constants.CHAT_MIN_WIDTH;
 
-/// Gooey's Wayland backend draws no title bar when the compositor offers no
-/// server-side decorations (GNOME), and it turns any left press in the top
-/// 32 px that the app did not handle into a window move. Clicks fire on
-/// release, so a press on a toolbar button counts as unhandled and the move
-/// grab swallows the click. Keep the toolbar below that strip on Linux.
-const TOOLBAR_PADDING_TOP: f32 = if (builtin.os.tag == .linux) 34 else 6;
-
 /// Bound to Cmd+Q and Ctrl+Q in `main.zig`'s keymap.
 pub const Quit = struct {};
 
@@ -45,6 +38,9 @@ fn quit(_: *AppState, effects: *Effects) void {
 
 pub fn render(cx: *Cx) void {
     const s = cx.state(AppState);
+    // macOS draws its title bar over the content (`main.zig`'s
+    // `.title_bar = .transparent`); elsewhere the inset is zero.
+    const strip = cx.titleBarInset();
 
     cx.render(ui.box(.{
         .style = .{
@@ -54,12 +50,19 @@ pub fn render(cx: *Cx) void {
         },
         .actions = &.{.{ .action = ui.action(Quit), .handler = cx.on(quit, .{}) }},
     }, .{
-        // Toolbar. Gooey 0.4 cut the transparent, full-size-content titlebar
-        // these icons used to float in, so they sit in a row of their own.
+        // Toolbar. On macOS the row is the title strip itself, so the icons
+        // sit on the traffic lights' line, clear of the lights. Empty space
+        // in it still moves the window; the buttons claim their presses.
+        // Linux without server decorations moves the window from its top
+        // 32 px the same way, so the toolbar can sit there too.
         ui.box(.{ .style = .{
             .direction = .row,
             .width = .{ .grow = 1 },
-            .padding = .{ .top = TOOLBAR_PADDING_TOP, .right = 10, .left = 10 },
+            .padding = .{
+                .top = if (strip.top > 0) 0 else 6,
+                .right = 10 + strip.right,
+                .left = 10 + strip.left,
+            },
             .gap = 2,
             .alignment = .{ .main = .end, .cross = .center },
         } }, .{
