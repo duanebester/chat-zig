@@ -28,6 +28,7 @@ const SettingsToggle = components.SettingsToggle;
 const ThemeToggle = components.ThemeToggle;
 
 const CHAT_MIN_WIDTH = components.constants.CHAT_MIN_WIDTH;
+const TOOLBAR_PADDING_X = components.constants.TOOLBAR_PADDING_X;
 
 /// Bound to Cmd+Q and Ctrl+Q in `main.zig`'s keymap.
 pub const Quit = struct {};
@@ -60,10 +61,10 @@ pub fn render(cx: *Cx) void {
             .width = .{ .grow = 1 },
             .padding = .{
                 .top = if (strip.top > 0) 0 else 6,
-                .right = 10 + strip.right,
-                .left = 10 + strip.left,
+                .right = TOOLBAR_PADDING_X + strip.right,
+                .left = TOOLBAR_PADDING_X + strip.left,
             },
-            .gap = 2,
+            .gap = components.constants.TOOLBAR_GAP,
             .alignment = .{ .main = .end, .cross = .center },
         } }, .{
             HistoryToggle{},
