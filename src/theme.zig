@@ -350,6 +350,11 @@ fn gooeyTheme(comptime t: Theme) gooey.Theme {
         .success = t.success,
         .warning = t.danger,
         .danger = t.danger,
+        // Labels on primary and danger fills (Gooey's Button and Checkbox,
+        // which ChatZig doesn't use today): the window colour, as the
+        // composer's own icons on primary already are.
+        .on_primary = t.bg.withAlpha(1),
+        .on_danger = t.bg.withAlpha(1),
         .text = t.text,
         .subtext = t.text_secondary,
         // Placeholders and the TextArea scrollbar.
