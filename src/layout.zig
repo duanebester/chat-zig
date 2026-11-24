@@ -39,6 +39,7 @@ fn quit(_: *AppState, effects: *Effects) void {
 
 pub fn render(cx: *Cx) void {
     const s = cx.state(AppState);
+    const show_chat = !s.history_expanded and !s.settings_expanded;
     // macOS draws its title bar over the content (`main.zig`'s
     // `.title_bar = .transparent`); elsewhere the inset is zero.
     const strip = cx.titleBarInset();
@@ -83,21 +84,9 @@ pub fn render(cx: *Cx) void {
             // hides along with `ContentArea` while browsing history or
             // settings. `history_expanded` and `settings_expanded` are kept
             // mutually exclusive by `AppState.toggleHistory`/`toggleSettings`.
-            ui.when(!s.history_expanded and !s.settings_expanded, chat),
-            ui.when(s.history_expanded, history),
-            ui.when(s.settings_expanded, settings),
+            if (s.history_expanded) HistoryPanel{} else null,
+            if (s.settings_expanded) SettingsPanel{} else null,
+            if (show_chat) .{ ContentArea{}, InputArea{} } else null,
         }),
     }));
-}
-
-fn chat(cx: *Cx) void {
-    cx.render(.{ ContentArea{}, InputArea{} });
-}
-
-fn history(cx: *Cx) void {
-    cx.render(HistoryPanel{});
-}
-
-fn settings(cx: *Cx) void {
-    cx.render(SettingsPanel{});
 }

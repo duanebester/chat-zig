@@ -1,8 +1,6 @@
 //! Chat model picker (Anthropic + OpenAI), shown in the settings panel.
 //!
-//! Gooey 0.2.9's `Select` drew a provider logo on each option. Gooey 0.4's
-//! `Select` takes text options only, so the logo of the selected model's
-//! provider sits beside the trigger instead.
+//! `Select` takes text options, so the selected provider's logo sits beside the trigger.
 
 const std = @import("std");
 const gooey = @import("gooey");
@@ -36,17 +34,15 @@ pub const ModelSelector = struct {
             .alignment = .center_cross,
             .gap = 10,
         } }, .{
-            ui.box(.{ .style = .{ .height = .{ .fixed = 32 }, .alignment = .center } }, .{
-                switch (s.selected_model.provider()) {
-                    .anthropic => icon(.{
-                        .path = logos.anthropic,
-                        .size = 18,
-                        .fill = .secondary,
-                        .viewbox = logos.anthropic_viewbox,
-                    }),
-                    .openai => icon(.{ .path = logos.openai, .size = 18, .fill = .secondary }),
-                },
-            }),
+            switch (s.selected_model.provider()) {
+                .anthropic => icon(.{
+                    .path = logos.anthropic,
+                    .size = 18,
+                    .fill = .secondary,
+                    .viewbox = logos.anthropic_viewbox,
+                }),
+                .openai => icon(.{ .path = logos.openai, .size = 18, .fill = .secondary }),
+            },
             Select{
                 .key = "model-select",
                 .options = &Model.display_names,

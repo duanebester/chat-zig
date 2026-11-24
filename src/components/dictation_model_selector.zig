@@ -37,9 +37,7 @@ pub const DictationModelSelector = struct {
         } }, .{
             // `speech` reads more clearly as "voice input" than a bare
             // microphone glyph.
-            ui.box(.{ .style = .{ .height = .{ .fixed = 32 }, .alignment = .center } }, .{
-                icon(.{ .path = Lucide.speech, .size = 18, .stroke = .secondary }),
-            }),
+            icon(.{ .path = Lucide.speech, .size = 18, .stroke = .secondary }),
             Select{
                 .key = "dictation-model-select",
                 .options = &DictationModel.display_names,
