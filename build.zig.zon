@@ -1,6 +1,6 @@
 .{
     .name = .chat_zig,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0xe10436242903a945,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
