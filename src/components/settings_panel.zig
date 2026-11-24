@@ -47,7 +47,7 @@ pub const SettingsPanel = struct {
             // page doesn't show a picker with nothing to pick from.
             if (s.has_openai_api_key) Card(DictationModelSelector){ .title = "Dictation model" } else null,
             Card(MicrophoneSettings){ .title = "Microphone" },
-            Card(ThemeSelector){ .title = "Theme" },
+            Card(ThemeSelector){ .title = "Palette" },
         }));
     }
 };

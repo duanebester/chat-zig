@@ -843,15 +843,12 @@ pub const AppState = struct {
     // Theme / Model Toggles
     // =========================================================================
 
-    /// The toolbar's theme button: the next theme in `Choice` order.
-    pub fn cycleTheme(self: *Self, effects: *Effects) void {
-        self.applyTheme(self.theme.next(), effects);
+    pub fn toggleThemeBrightness(self: *Self, effects: *Effects) void {
+        self.applyTheme(self.theme.oppositeBrightness(), effects);
     }
 
-    /// The Settings theme `Select`.
-    pub fn selectTheme(self: *Self, index: u32, effects: *Effects) void {
-        std.debug.assert(index < theme_mod.Choice.count);
-        self.applyTheme(@fromBackingInt(@intCast(index)), effects);
+    pub fn selectPalette(self: *Self, family: theme_mod.Family, effects: *Effects) void {
+        self.applyTheme(self.theme.withFamily(family), effects);
     }
 
     /// Gooey's stock components (`TextArea`, `Select`) and the macOS title

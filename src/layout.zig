@@ -64,7 +64,6 @@ pub fn render(cx: *Cx) void {
                 .right = TOOLBAR_PADDING_X + strip.right,
                 .left = TOOLBAR_PADDING_X + strip.left,
             },
-            .gap = components.constants.TOOLBAR_GAP,
             .alignment = .{ .main = .end, .cross = .center },
         } }, .{
             HistoryToggle{},
