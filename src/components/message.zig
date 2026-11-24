@@ -34,7 +34,11 @@ const CHIP_PADDING_Y: f32 = 6;
 const CHIP_ICON_SIZE: f32 = 14;
 
 const message_text: ui.Text = .{ .size = MESSAGE_TEXT_SIZE, .wrap = .words };
-const chip_text: ui.Text = .{ .size = 13, .weight = .medium };
+const chip_text: ui.Text = .{
+    .size = 13,
+    .weight = .medium,
+    .overflow = .ellipsis,
+};
 
 pub const MessageRow = struct {
     index: u32,
@@ -93,7 +97,10 @@ fn renderUser(cx: *Cx, msg: *const Message, t: theme_mod.Theme) void {
         .border = .{ .width = 1, .color = .{ .rgba = t.user_bubble_border } },
         .corner_radius = .all(BUBBLE_CORNER_RADIUS),
     } }, .{
-        if (msg.hasAttachment()) AttachmentChip{ .name = msg.getAttachedFileName() } else null,
+        if (msg.hasAttachment()) ui.box(.{ .style = .{
+            .direction = .row,
+            .width = .{ .grow = 1 },
+        } }, .{AttachmentChip{ .name = msg.getAttachedFileName() }}) else null,
         MessageText{ .text = msg.getText(), .color = t.text },
     }));
 }

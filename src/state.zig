@@ -25,6 +25,7 @@ const Effects = gooey.Effects;
 
 const anthropic = @import("http/anthropic.zig");
 const openai = @import("http/openai.zig");
+pub const Effort = @import("http/http.zig").Effort;
 const audio = @import("audio/mod.zig");
 const compaction = @import("compaction.zig");
 const session_log_mod = @import("session_log.zig");
@@ -327,9 +328,6 @@ pub const Message = struct {
 // AppState
 // =============================================================================
 
-/// The settings panel's dropdowns, for `AppState.open_select`.
-pub const SelectId = enum(u8) { model, dictation_model, microphone, theme };
-
 pub const AppState = struct {
     const Self = @This();
 
@@ -409,12 +407,9 @@ pub const AppState = struct {
     /// of past sessions) instead of `ContentArea`'s message list. Mutually
     /// exclusive with `settings_expanded` — see `toggleHistory`.
     history_expanded: bool = false,
-    /// Which settings dropdown has its menu open. Gooey 0.4's `Select` is
-    /// controlled: the app owns the open flag and closes it on a pick or a
-    /// click outside.
-    open_select: ?SelectId = null,
 
     selected_model: Model = .haiku,
+    effort_value: f32 = @floatFromInt(@backingInt(Effort.medium)),
     selected_dictation_model: DictationModel = .gpt_transcribe,
     microphone: MicrophoneState = .{},
     recording: RecordingState = .{},
@@ -631,12 +626,11 @@ pub const AppState = struct {
         self.is_loading = true;
         self.error_message = null;
 
-        // A full job table panics, naming `events.job_count_max`; chat-zig
-        // runs at most one chat job and one transcription.
+        // No other chat job is live, and transcription can occupy only one slot.
         self.chat_job = effects.spawn(jobs.ChatJob, &.{ .provider = provider }, .{
             .on_result = effects.handler(Self.onChatResult),
             .on_done = effects.handler(Self.onChatDone),
-        });
+        }) catch @panic("ChatZig job table full despite the single-flight chat guard");
     }
 
     // =========================================================================
@@ -849,16 +843,12 @@ pub const AppState = struct {
     // Theme / Model Toggles
     // =========================================================================
 
-    /// The toolbar's theme button: the next theme in `Choice` order.
-    pub fn cycleTheme(self: *Self, effects: *Effects) void {
-        self.applyTheme(self.theme.next(), effects);
+    pub fn toggleThemeBrightness(self: *Self, effects: *Effects) void {
+        self.applyTheme(self.theme.oppositeBrightness(), effects);
     }
 
-    /// The Settings theme `Select`.
-    pub fn selectTheme(self: *Self, index: u32, effects: *Effects) void {
-        std.debug.assert(index < theme_mod.Choice.count);
-        self.applyTheme(@fromBackingInt(@intCast(index)), effects);
-        self.open_select = null;
+    pub fn selectPalette(self: *Self, family: theme_mod.Family, effects: *Effects) void {
+        self.applyTheme(self.theme.withFamily(family), effects);
     }
 
     /// Gooey's stock components (`TextArea`, `Select`) and the macOS title
@@ -877,7 +867,6 @@ pub const AppState = struct {
         std.debug.assert(self.message_count <= MAX_MESSAGES);
         self.settings_expanded = !self.settings_expanded;
         if (self.settings_expanded) self.history_expanded = false;
-        self.open_select = null;
     }
 
     /// Toggles the history panel. Opening it re-scans `sessions/*.jsonl`
@@ -890,7 +879,6 @@ pub const AppState = struct {
         self.history_expanded = !self.history_expanded;
         if (self.history_expanded) self.settings_expanded = false;
         if (self.history_expanded) self.refreshSessionHistory();
-        self.open_select = null;
     }
 
     /// Scans `sessions/*.jsonl` (via `session_log.listSessions`) into
@@ -1040,31 +1028,25 @@ pub const AppState = struct {
     pub fn selectModel(self: *Self, index: u32) void {
         std.debug.assert(index < MODEL_COUNT);
         self.selected_model = @fromBackingInt(@intCast(index));
-        self.open_select = null;
+    }
+
+    pub fn effort(self: *const Self) Effort {
+        std.debug.assert(self.effort_value >= 0);
+        std.debug.assert(self.effort_value <= @as(f32, @floatFromInt(@backingInt(Effort.xhigh))));
+        std.debug.assert(self.effort_value == @trunc(self.effort_value));
+        return @fromBackingInt(@intFromFloat(self.effort_value));
     }
 
     pub fn selectDictationModel(self: *Self, index: u32) void {
         std.debug.assert(index < DICTATION_MODEL_COUNT);
         std.debug.assert(index < DictationModel.api_names.len);
         self.selected_dictation_model = @fromBackingInt(@intCast(index));
-        self.open_select = null;
     }
 
     pub fn selectMicrophone(self: *Self, index: u32) void {
         std.debug.assert(index < self.microphone.devices.count);
         std.debug.assert(index < audio.MAX_INPUT_DEVICES);
         self.microphone.selected = index;
-        self.open_select = null;
-    }
-
-    /// `Select.on_toggle`: opens `select`'s menu, closing any other.
-    pub fn toggleSelect(self: *Self, select: SelectId) void {
-        self.open_select = if (self.open_select == select) null else select;
-    }
-
-    /// `Select.on_close`: a click outside the open menu, or Escape.
-    pub fn closeSelect(self: *Self, select: SelectId) void {
-        if (self.open_select == select) self.open_select = null;
     }
 
     pub fn refreshMicrophones(self: *Self) void {
@@ -1132,7 +1114,10 @@ pub const AppState = struct {
         _ = effects.spawn(jobs.TranscribeJob, &input, .{
             .on_result = effects.handler(Self.onTranscribed),
             .on_done = effects.handler(Self.onTranscribeDone),
-        });
+        }) catch {
+            self.error_message = "Transcription is busy; the recording was saved";
+            return;
+        };
         self.is_transcribing = true;
         self.error_message = null;
     }
@@ -1151,11 +1136,13 @@ pub const AppState = struct {
 
     /// Asks Gooey for the native open dialog; the pick arrives in
     /// `fileChosen` on a later drain, on the main thread.
-    pub fn openFileDialog(_: *Self, effects: *Effects) void {
+    pub fn openFileDialog(self: *Self, effects: *Effects) void {
         effects.openFileDialog(.{
             .kind = .{ .open = .{ .files = true, .directories = false, .multiple = false } },
             .on_complete = effects.handler(Self.fileChosen),
-        });
+        }) catch {
+            self.error_message = "The file picker is busy; try again after it closes";
+        };
     }
 
     pub fn fileChosen(self: *Self, effects: *Effects) void {

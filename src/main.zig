@@ -36,9 +36,20 @@ pub const App = gooey.App(AppState, layout.render, .{
     // Narrower than the chat column's minimum, the layout clips on the right.
     .min_width = @intFromFloat(@import("components/constants.zig").WINDOW_MIN_WIDTH),
     // Ctrl+Q for Linux and Windows; macOS also gets Cmd+Q from its app menu.
-    .keymap = &.{
+    .keymap = gooey.keymaps.text_default ++ &[_]gooey.keymaps.Binding{
         .{ .keys = "cmd-q", .action = gooey.ui.action(layout.Quit) },
         .{ .keys = "ctrl-q", .action = gooey.ui.action(layout.Quit) },
+        .{
+            .keys = "enter",
+            .action = gooey.ui.action(@import("components/input_area.zig").Send),
+            .key_context = gooey.keymaps.context_area,
+        },
+        .{
+            .keys = "shift-enter",
+            .action = gooey.ui.action(gooey.actions.TextCommand),
+            .arg = @backingInt(gooey.actions.TextCommand.newline),
+            .key_context = gooey.keymaps.context_area,
+        },
     },
     .jobs = &.{ jobs.ChatJob, jobs.TranscribeJob },
     .on_init = AppState.init,

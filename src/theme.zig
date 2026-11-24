@@ -290,25 +290,43 @@ pub const macchiato = catppuccin(macchiato_palette, .dark);
 // Theme Choice
 // =============================================================================
 
-/// The theme the user picked: a `Select` in Settings, and the toolbar's
-/// theme button, which steps through them in this order.
+pub const Family = enum(u8) { default, catppuccin };
+
+/// The active theme combines the Settings palette and the toolbar brightness.
 pub const Choice = enum(u8) {
     light,
     dark,
     latte,
     macchiato,
 
-    pub const count = @typeInfo(Choice).@"enum".field_names.len;
-
-    /// The settings `Select`'s options, in declaration order.
-    pub const display_names = [count][]const u8{ "Light", "Dark", "Latte", "Macchiato" };
-
-    pub fn next(self: Choice) Choice {
-        return @fromBackingInt(@intCast((@as(u32, @backingInt(self)) + 1) % count));
+    pub fn family(self: Choice) Family {
+        return switch (self) {
+            .light, .dark => .default,
+            .latte, .macchiato => .catppuccin,
+        };
     }
 
-    pub fn displayName(self: Choice) []const u8 {
-        return display_names[@backingInt(self)];
+    pub fn isDark(self: Choice) bool {
+        return switch (self) {
+            .light, .latte => false,
+            .dark, .macchiato => true,
+        };
+    }
+
+    pub fn withFamily(self: Choice, target: Family) Choice {
+        return switch (target) {
+            .default => if (self.isDark()) .dark else .light,
+            .catppuccin => if (self.isDark()) .macchiato else .latte,
+        };
+    }
+
+    pub fn oppositeBrightness(self: Choice) Choice {
+        return switch (self) {
+            .light => .dark,
+            .dark => .light,
+            .latte => .macchiato,
+            .macchiato => .latte,
+        };
     }
 };
 
@@ -390,9 +408,16 @@ pub fn gooeyFor(choice: Choice) *const gooey.Theme {
 
 comptime {
     for (std.enums.values(Choice)) |choice| {
-        const expect_dark = choice == .dark or choice == .macchiato;
-        if (gooeyFor(choice).isDark() != expect_dark) {
+        if (gooeyFor(choice).isDark() != choice.isDark()) {
             @compileError("theme " ++ @tagName(choice) ++ " has the wrong light/dark look");
         }
+        for (std.enums.values(Family)) |family| {
+            const selected = choice.withFamily(family);
+            std.debug.assert(selected.family() == family);
+            std.debug.assert(selected.isDark() == choice.isDark());
+        }
+        const toggled = choice.oppositeBrightness();
+        std.debug.assert(toggled.family() == choice.family());
+        std.debug.assert(toggled.isDark() != choice.isDark());
     }
 }

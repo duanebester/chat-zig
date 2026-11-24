@@ -1,12 +1,12 @@
 .{
     .name = .chat_zig,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0xe10436242903a945,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .gooey = .{
-            .url = "git+https://github.com/duanebester/gooey?ref=v0.6.4#0e76821725c1a5c4aedf40f257c8fbe14d5e035a",
-            .hash = "gooey-0.6.4-uPBZ7mGHXQDPho5mV8fCMDz62G6hkAz039pJKJOp7Rwt",
+            .url = "git+https://github.com/duanebester/gooey?ref=v0.6.8#a585b31ae92677175aa3da8c2df68adb585e658e",
+            .hash = "gooey-0.6.8-uPBZ7hlSUwDShqO0UwcPyeEWmteR97zsb3TxZBVS2Jxv",
         },
     },
     .paths = .{

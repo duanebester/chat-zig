@@ -27,6 +27,8 @@ comptime {
     // fits, beside the chrome.
     std.debug.assert(state.MAX_MESSAGE_LEN < limits.build.text_bytes_frame_max);
     std.debug.assert(state.MAX_INPUT_LEN <= limits.text.area.bytes_max);
+    std.debug.assert(limits.events.job_count_max >= 2);
+    std.debug.assert(jobs.ChatJob.posts_max + jobs.TranscribeJob.posts_max <= limits.events.job_result_count_max);
     std.debug.assert(@sizeOf(jobs.ChatJob.Result) <= limits.events.job_result_bytes_max);
     std.debug.assert(@sizeOf(jobs.TranscribeJob.Result) <= limits.events.job_result_bytes_max);
     // One row per message, and one cached size per message text.

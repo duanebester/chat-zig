@@ -16,7 +16,6 @@ pub const CONTENT_PADDING: f32 = 24;
 pub const CHAT_MIN_WIDTH: f32 = 400;
 pub const TOOLBAR_BUTTON_WIDTH: f32 = 36;
 pub const TOOLBAR_BUTTON_COUNT: f32 = 3;
-pub const TOOLBAR_GAP: f32 = 2;
 pub const TOOLBAR_PADDING_X: f32 = 10;
 /// The traffic lights' inset on macOS (`cx.titleBarInset().left`), as
 /// measured on macOS 26: the lights span 8 to 70 pt, plus the 8 pt margin.
@@ -24,11 +23,11 @@ pub const TRAFFIC_LIGHTS_INSET: f32 = 78;
 
 /// The narrowest window the layout fits: the wider of the chat column's
 /// `width_min`, below which the column clips on the right, and the toolbar
-/// (its padding, the lights' inset, and the buttons with their gaps), below
+/// (its padding, the lights' inset, and the button widths), below
 /// which the icons clip. The column decides it today.
 pub const WINDOW_MIN_WIDTH: f32 = @max(CHAT_MIN_WIDTH, toolbar_width_min);
 const toolbar_width_min: f32 = 2 * TOOLBAR_PADDING_X + TRAFFIC_LIGHTS_INSET +
-    TOOLBAR_BUTTON_COUNT * TOOLBAR_BUTTON_WIDTH + (TOOLBAR_BUTTON_COUNT - 1) * TOOLBAR_GAP;
+    TOOLBAR_BUTTON_COUNT * TOOLBAR_BUTTON_WIDTH;
 
 /// The rounded, pointer-cursor box the toolbar's icon buttons share: 36 px
 /// square, or as tall as macOS's title strip (`cx.titleBarInset().top`)

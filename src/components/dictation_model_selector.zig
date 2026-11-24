@@ -37,17 +37,12 @@ pub const DictationModelSelector = struct {
         } }, .{
             // `speech` reads more clearly as "voice input" than a bare
             // microphone glyph.
-            ui.box(.{ .style = .{ .height = .{ .fixed = 32 }, .alignment = .center } }, .{
-                icon(.{ .path = Lucide.speech, .size = 18, .stroke = .secondary }),
-            }),
+            icon(.{ .path = Lucide.speech, .size = 18, .stroke = .secondary }),
             Select{
                 .key = "dictation-model-select",
                 .options = &DictationModel.display_names,
                 .on_select = &on_select,
-                .on_toggle = cx.on(AppState.toggleSelect, .{ .arg = state_mod.SelectId.dictation_model }),
-                .on_close = cx.on(AppState.closeSelect, .{ .arg = state_mod.SelectId.dictation_model }),
                 .selected = @backingInt(s.selected_dictation_model),
-                .open = s.open_select == .dictation_model,
                 .width = 240,
                 .accessible_name = "Dictation model",
             },

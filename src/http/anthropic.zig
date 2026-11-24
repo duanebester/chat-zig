@@ -144,6 +144,7 @@ pub const ChatRequest = struct {
     /// Ask for a summary instead of a reply (`"compaction":{"type":
     /// "summarize"}`). Only through `compact`, which parses the block.
     summarize: bool = false,
+    effort: ?net.Effort = null,
 };
 
 /// Beta that both requests a native summary and lets a request carry the
@@ -1022,6 +1023,9 @@ pub const AnthropicClient = struct {
         const max_tokens = if (request.summarize) COMPACTION_MAX_TOKENS else MAX_TOKENS;
         try writer.print("{{\"model\":\"{s}\",\"max_tokens\":{d}", .{ request.model, max_tokens });
         try writeOptionalSystemField(writer, request.system);
+        if (request.effort) |effort| {
+            try writer.print(",\"output_config\":{{\"effort\":\"{s}\"}}", .{@tagName(effort)});
+        }
         if (request.summarize) try writer.writeAll(",\"compaction\":{\"type\":\"summarize\"}");
 
         // Streaming flag: when a sink is provided, ask the server for SSE.

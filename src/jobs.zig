@@ -107,6 +107,7 @@ pub const Conversation = struct {
     summary: Summary = .{},
     summary_covers: u64 = 0,
     model: Model = .haiku,
+    effort: state.Effort = .medium,
     attachment_path: [MAX_FILE_PATH_LEN]u8 = undefined,
     attachment_path_len: u32 = 0,
 
@@ -136,6 +137,7 @@ pub const Conversation = struct {
         self.summary.copyFrom(&app.summary);
         self.summary_covers = app.summary_covers;
         self.model = app.selected_model;
+        self.effort = app.effort();
         @memcpy(self.attachment_path[0..attachment.len], attachment);
         self.attachment_path_len = @intCast(attachment.len);
     }
@@ -317,6 +319,7 @@ fn buildAnthropicChatRequest(
         .messages = buf.messages[0..buf.count],
         .system = composeSystemInstruction(&buf.system_buf, if (native) "" else view.summary.text()),
         .compaction_block = if (native) blockOf(view.summary) else null,
+        .effort = conversation.effort,
     };
 }
 
@@ -391,6 +394,7 @@ fn buildOpenAIChatRequest(
     return .{
         .model = conversation.model.apiName(),
         .messages = buf.messages[0..buf.count],
+        .effort = conversation.effort,
     };
 }
 
@@ -451,6 +455,11 @@ fn buildSummaryRequest(
 /// first delta), and at most one `.failure`, which is last. A reply longer
 /// than `state.MAX_RESPONSE_LEN` is cut there.
 pub const ChatJob = struct {
+    // Chat runs on native workers. Posts beyond this drain budget wait for
+    // a free result slot; reserve room in the budget for a transcription.
+    pub const posts_max: u32 = gooey.ResourceLimits.small.events.job_result_count_max -
+        TranscribeJob.posts_max;
+
     pub const Input = struct {
         provider: state.ModelProvider,
     };
@@ -682,6 +691,8 @@ const Stream = struct {
 
 /// Transcribes a finished recording with the selected OpenAI model.
 pub const TranscribeJob = struct {
+    pub const posts_max: u32 = 1;
+
     pub const Input = struct {
         /// A copy of the recording's path: a new recording overwrites
         /// `RecordingState.path_buffer` while this job may still run.

@@ -1,8 +1,6 @@
 //! Chat model picker (Anthropic + OpenAI), shown in the settings panel.
 //!
-//! Gooey 0.2.9's `Select` drew a provider logo on each option. Gooey 0.4's
-//! `Select` takes text options only, so the logo of the selected model's
-//! provider sits beside the trigger instead.
+//! `Select` takes text options, so the selected provider's logo sits beside the trigger.
 
 const std = @import("std");
 const gooey = @import("gooey");
@@ -10,6 +8,7 @@ const Cx = gooey.Cx;
 const ui = gooey.ui;
 const Handler = gooey.Handler;
 const Select = @import("gooey-components").Select;
+const Slider = @import("gooey-components").Slider;
 
 const state_mod = @import("../state.zig");
 const icon = @import("icon.zig").icon;
@@ -35,28 +34,43 @@ pub const ModelSelector = struct {
             .alignment = .center_cross,
             .gap = 10,
         } }, .{
-            ui.box(.{ .style = .{ .height = .{ .fixed = 32 }, .alignment = .center } }, .{
-                switch (s.selected_model.provider()) {
-                    .anthropic => icon(.{
-                        .path = logos.anthropic,
-                        .size = 18,
-                        .fill = .secondary,
-                        .viewbox = logos.anthropic_viewbox,
-                    }),
-                    .openai => icon(.{ .path = logos.openai, .size = 18, .fill = .secondary }),
-                },
-            }),
+            switch (s.selected_model.provider()) {
+                .anthropic => icon(.{
+                    .path = logos.anthropic,
+                    .size = 18,
+                    .fill = .secondary,
+                    .viewbox = logos.anthropic_viewbox,
+                }),
+                .openai => icon(.{ .path = logos.openai, .size = 18, .fill = .secondary }),
+            },
             Select{
                 .key = "model-select",
                 .options = &Model.display_names,
                 .on_select = &on_select,
-                .on_toggle = cx.on(AppState.toggleSelect, .{ .arg = state_mod.SelectId.model }),
-                .on_close = cx.on(AppState.closeSelect, .{ .arg = state_mod.SelectId.model }),
                 .selected = @backingInt(s.selected_model),
-                .open = s.open_select == .model,
                 .width = 240,
                 .accessible_name = "Chat model",
             },
+        }));
+
+        cx.render(ui.box(.{ .style = .{
+            .direction = .row,
+            .alignment = .center_cross,
+            .gap = 10,
+        } }, .{
+            ui.text("Effort", .{ .color = .subtext, .size = 12, .weight = .medium }),
+            Slider{
+                .key = "chat-effort",
+                .bind = &s.effort_value,
+                .min = 0,
+                .max = @floatFromInt(@backingInt(state_mod.Effort.xhigh)),
+                .step = 1,
+                .width = 150,
+                .accessible_name = "Chat model effort",
+                .accessible_description = "Use arrow keys to set effort for chat replies: " ++
+                    "low, medium, high, or extra high.",
+            },
+            ui.text(@tagName(s.effort()), .{ .color = .text, .size = 12, .weight = .medium }),
         }));
     }
 };

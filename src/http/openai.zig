@@ -247,6 +247,7 @@ pub const ChatMessage = struct {
 pub const ChatRequest = struct {
     model: []const u8,
     messages: []const ChatMessage,
+    effort: net.Effort,
 };
 
 /// Callback invoked from the HTTP fiber for each streamed content chunk.
@@ -400,8 +401,9 @@ pub const OpenAIClient = struct {
         // models — the GPT chat models this client targets fall in that
         // family.
         try writer.print(
-            "{{\"model\":\"{s}\",\"max_completion_tokens\":{d},\"stream\":true,\"messages\":[",
-            .{ request.model, MAX_CHAT_TOKENS },
+            "{{\"model\":\"{s}\",\"max_completion_tokens\":{d},\"reasoning_effort\":\"{s}\"" ++
+                ",\"stream\":true,\"messages\":[",
+            .{ request.model, MAX_CHAT_TOKENS, @tagName(request.effort) },
         );
 
         var first = true;

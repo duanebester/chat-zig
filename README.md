@@ -5,30 +5,29 @@ to both Anthropic's Claude and OpenAI's GPT models.
 
 Inspired by [chat-ai](https://github.com/duanebester/chat-ai) (GPUI/Rust version).
 
-> **Status:** Zig 0.17 / Gooey v0.6.4. Runs on macOS and on Linux (Wayland).
-> HTTP runs as Gooey background jobs (`effects.spawn`) that post results back to the
-> main thread; files and session logs use `std.Io.Dir` / `std.Io.File`;
-> both the Anthropic and OpenAI paths use the `io`-aware `std.http.Client`.
+> **ChatZig v0.1.1** · Zig 0.17 · Gooey v0.6.8 · macOS and Linux (Wayland)
 
 <img src="assets/themes.png" width="820px"
   alt="ChatZig in its Light, Catppuccin Latte, Catppuccin Macchiato, and Dark themes" />
 
 ## Features
 
-- 💬 Chat with Claude and GPT models, switchable per-conversation from the settings panel
-- 🎙️ Voice dictation — record a microphone clip and transcribe it via OpenAI (`gpt-transcribe`)
+- 💬 Chat with Claude and GPT. Change the model for your next reply in Settings → Chat model.
+- The Effort slider sets reasoning effort for chat replies: low, medium (default), high, or xhigh.
+- 🎙️ Voice dictation on macOS — record a microphone clip and transcribe it with GPT-Transcribe.
 - 🧹 Automatic chat compaction — long conversations are summarized so requests stay bounded, with Anthropic's native compaction where the model supports it (see [`docs/CHAT_COMPACTION.md`](docs/CHAT_COMPACTION.md))
 - 💾 Session persistence — conversations are logged to `sessions/*.jsonl` and browsable/restorable from a history panel
-- 🎨 Four themes — Light, Dark, and Catppuccin Latte and Macchiato — from Settings or the toolbar
-- 📜 Streaming replies into a scrolling transcript of any length that follows the newest message
+- 🎨 Pick Default or Catppuccin in Settings. The toolbar toggles light and dark mode.
+- 📜 The transcript follows streamed replies until you scroll up.
 - 🔄 Async HTTP requests as Gooey background jobs (non-blocking UI, no polling, zero heap per result), with retry/backoff shared across providers
 - ✂️ Stop button cancels the in-flight request
-- ⌨️ Text input (with IME) and send button, file attachments, and a live microphone level meter while recording
+- ⌨️ Enter sends a chat message; Shift+Enter starts a new line. The composer supports IME input,
+  a live microphone level meter, and image and PDF attachments with Claude models.
 
-## Runtime
+## Runtime benchmark (Gooey v0.6.2)
 
-Measured on a MacBook Pro (M2 Max) running macOS 26.6, ReleaseFast build, with a
-1000×750 pt window on a 120 Hz display.
+Historical measurements, not rerun for ChatZig v0.1.1. Captured on a MacBook Pro (M2 Max)
+running macOS 26.6, with a ReleaseFast build and a 1000×750 pt window on a 120 Hz display.
 
 | | |
 |---|---|
@@ -47,13 +46,16 @@ Memory is `vmmap --summary` physical footprint; frame times come from a
 ## Prerequisites
 
 1. **Zig 0.17.0** or newer — Install from [ziglang.org](https://ziglang.org/download/). Gooey 0.6 requires it (`minimum_zig_version`).
-2. **Anthropic API Key** — Get one from [Anthropic Console](https://console.anthropic.com/). Required for Claude models.
-3. **OpenAI API Key** (optional) — Get one from [OpenAI Platform](https://platform.openai.com/). Enables GPT chat models and voice dictation transcription; the app runs fine without it, just with those features disabled.
+2. **API keys** — Set `ANTHROPIC_API_KEY` for Claude from the
+   [Anthropic Console](https://console.anthropic.com/), or `OPENAI_API_KEY` for GPT and voice
+   transcription from the [OpenAI Platform](https://platform.openai.com/). Set both to use both
+   providers. You can launch the app and browse local history without keys.
 
-Gooey is pinned to [v0.6.4](https://github.com/duanebester/gooey/releases/tag/v0.6.4) in `build.zig.zon`. To move to another release:
+Gooey is pinned to [v0.6.8](https://github.com/duanebester/gooey/releases/tag/v0.6.8) in
+`build.zig.zon`. To move to another release:
 
 ```bash
-zig fetch --save git+https://github.com/duanebester/gooey#v0.6.4
+zig fetch --save git+https://github.com/duanebester/gooey#v0.6.8
 ```
 
 **macOS** 14 or newer. **Linux** needs a Wayland compositor and Gooey's system libraries
@@ -66,18 +68,18 @@ sudo apt install libwayland-dev libvulkan-dev libfreetype-dev libharfbuzz-dev \
 ```
 
 Without a Vulkan driver, build with `-Dlinux-backend=wayland_cpu`. Microphone recording
-uses CoreAudio, so on Linux the record button stays disabled; everything else works.
+uses CoreAudio and is unavailable on Linux.
 
 ## Setup
 
 ```bash
 # Clone
-git clone https://github.com/yourusername/chat-zig
+git clone https://github.com/duanebester/chat-zig
 cd chat-zig
 
-# Set your API key(s)
-export ANTHROPIC_API_KEY="your-key-here"
-export OPENAI_API_KEY="your-key-here"   # optional: GPT models + voice dictation
+# Set the keys for the providers you use
+export ANTHROPIC_API_KEY="your-anthropic-key"   # Claude
+export OPENAI_API_KEY="your-openai-key"         # GPT and voice transcription
 
 # Build and run
 zig build run
@@ -106,28 +108,28 @@ ChatZig follows Gooey's app shape: one state struct, a render function, and hand
 
 ### Async result flow
 
-`sendMessage` copies the conversation into `jobs.exchange`, an app-owned buffer, and
+`sendMessage` snapshots the request, including the selected model and effort, in `jobs.exchange` and
 starts a `ChatJob` with `effects.spawn`. The job runs on a worker Gooey owns and never
 touches `AppState`; each streamed piece it posts arrives at `AppState.onChatResult` on
 the main thread in the next drain, and each post wakes the event loop, so nothing polls.
 The Stop button calls `effects.cancelJob`, and at quit Gooey cancels and joins every job
-before `on_deinit`. When no job runs the app requests no frames and sits idle.
+before `on_deinit`.
 
 ### Resource budget
 
 Gooey reserves every pool at startup from one `gooey.ResourceLimits` value and
-panics, naming the field, if a frame needs more. ChatZig uses `.small` unchanged
-(`src/limits.zig`). The transcript is a `List` whose rows measure their text with
-`cx.measureText`, so it builds only the messages in view, and Gooey draws only the
+panics, naming the field, if a frame needs more. ChatZig uses `.small` with an 8 KiB
+job-result payload limit (`src/limits.zig`). The transcript is a `List` whose rows measure their
+text with `cx.measureText`, so it builds only the messages in view, and Gooey draws only the
 glyphs a scroll box shows: a frame's cost follows the window, not the conversation.
 The list is anchored at its end, so a streamed reply stays in view while you are at
 the bottom; scrolling up releases it, and sending a message jumps back down.
 
 ### Compaction and session persistence
 
-Long conversations are summarized rather than truncated: `AppState.messages`
-is never mutated, and a small summary + cut index is layered on top only
-when assembling the next request. On Claude models that support it, the
+For long conversations, compaction adds a summary and a cut index when assembling the next
+request, without rewriting the visible transcript. The live transcript holds the latest 256
+messages; older turns remain in the session log. On Claude models that support it, the
 summary is Anthropic's native on-demand compaction block (signed, sent back
 verbatim, and kept in the session log); other models, or a failed
 compaction call, fall back to a client-side summary. See

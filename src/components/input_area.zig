@@ -20,6 +20,8 @@ const INPUT_CARD_CORNER_RADIUS = constants.INPUT_CARD_CORNER_RADIUS;
 /// The text row's horizontal padding inside the card.
 const TEXT_ROW_PADDING_X: f32 = 16;
 
+pub const Send = struct {};
+
 pub const InputArea = struct {
     pub fn render(_: @This(), cx: *Cx) void {
         const s = cx.state(AppState);
@@ -39,6 +41,7 @@ pub const InputArea = struct {
         cx.render(ui.box(.{
             .key = .{ .name = "composer" },
             .style = .{ .width = .{ .grow = 1 }, .gap = 12 },
+            .actions = &.{.{ .action = ui.action(Send), .handler = cx.on(AppState.sendMessage, .{}) }},
         }, .{
             if (compaction_banner) |text| CompactionBanner{ .text = text } else null,
             if (s.error_message) |text| ErrorBanner{ .text = text } else null,
@@ -123,6 +126,7 @@ const AttachedFile = struct {
         const t = theme_mod.get(cx.state(AppState).theme);
         cx.render(ui.box(.{ .style = .{
             .direction = .row,
+            .width = .{ .grow = 1 },
             .padding = .symmetric(16, 4),
             .alignment = .center_cross,
         } }, .{
@@ -135,7 +139,11 @@ const AttachedFile = struct {
                 .corner_radius = .all(8),
             } }, .{
                 icon(.{ .path = Lucide.paperclip, .size = 14, .stroke = .primary }),
-                ui.text(self.name, .{ .color = .primary, .size = 13 }),
+                ui.text(self.name, .{
+                    .color = .primary,
+                    .size = 13,
+                    .overflow = .ellipsis,
+                }),
                 ui.box(.{
                     .style = .{
                         .width = .{ .fixed = 20 },
