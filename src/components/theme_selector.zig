@@ -28,10 +28,7 @@ pub const ThemeSelector = struct {
             .key = "theme-select",
             .options = &Choice.display_names,
             .on_select = &on_select,
-            .on_toggle = cx.on(AppState.toggleSelect, .{ .arg = state_mod.SelectId.theme }),
-            .on_close = cx.on(AppState.closeSelect, .{ .arg = state_mod.SelectId.theme }),
             .selected = @backingInt(s.theme),
-            .open = s.open_select == .theme,
             .width = 240,
             .accessible_name = "Theme",
         });

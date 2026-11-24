@@ -7,6 +7,8 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Uri = std.Uri;
 
+pub const Effort = enum(u8) { low, medium, high, xhigh };
+
 pub const MAX_FETCH_ATTEMPTS: u32 = 3;
 pub const BASE_BACKOFF_MS: u64 = 500;
 pub const JITTER_PERCENT: u64 = 25;
